@@ -1,7 +1,7 @@
 ---
-title: "CodeStatus: HTTP-Inspired Packet Status Codes"
+title: "CodeStatus: HTTP-Inspired Status Codes for Terbin Packets"
 sidebarTitle: "CodeStatus"
-description: "Reference for all CodeStatus enum values used in Terbin packet headers — covering informational, success, execution, client error, and server error ranges."
+description: "Reference for all CodeStatus enum values in Terbin packet headers, covering informational, success, execution, client, and server error ranges."
 ---
 
 `CodeStatus` is a `short` enum that travels in every packet exchange as `Header.Status` and `InfoResponse.Status`. It communicates the outcome or intent of a packet — whether a request is being dispatched for the first time, succeeded, failed on the client side, or caused an internal worker fault. The design is intentionally HTTP-inspired: the hundreds digit signals the broad category, while the units provide the specific condition.

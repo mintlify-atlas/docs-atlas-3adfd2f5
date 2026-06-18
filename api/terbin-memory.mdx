@@ -113,7 +113,7 @@ High-level helpers used internally by `TerbinCommunicator.handleReceive`.
 <ParamField path="TryGetMemoryStream(PacketRequest pCapsule, out byte[] pMemory)" type="TerbinErrorCode">
   The main entry point for the receive loop.
   - If `pCapsule.Head.OrderRequest != FINAL_PACKET`: returns the packet's own `Payload` directly (single packet, no memory slot involved).
-  - If `pCapsule.Head.OrderRequest == FINAL_PACKET`: calls `TryAssembleStream`, then `TryReleaseMemory`. Returns `None` on success, `ErrorGetPayloadMemory` or `MemoryReleaseFailed` on errors.
+  - If `pCapsule.Head.OrderRequest == FINAL_PACKET`: calls `TryAssembleStream`, then `TryReleaseMemory`. Returns `None` on success, the `TerbinErrorCode` from `TryAssembleStream` on assembly failure, or `MemoryReleaseFailed` if the slot could not be freed.
 </ParamField>
 
 <ParamField path="TryAssembleStream(PacketRequest pCapsule, out byte[] pMemory)" type="TerbinErrorCode">

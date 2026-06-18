@@ -1,7 +1,7 @@
 ---
-title: "Data Models: Manifests, References, and DTOs"
+title: "Terbin Data Models: Manifests, References, and DTOs"
 sidebarTitle: "Manifests"
-description: "Reference for Terbin's data model classes: ManifestInstance, ManifestPlugin, ReferenceInstance, ReferencePluginStore, and their IStructSerializable DTO counterparts."
+description: "Reference for Terbin's manifest and reference classes, their IStructSerializable DTO counterparts, and the DirectoryHandwritten and MaxProgressDTO types."
 ---
 
 Terbin's data layer uses two parallel class hierarchies: **manifest/reference classes** (rich domain objects stored as JSON on disk) and **DTO structs** (compact `IStructSerializable` structs sent over the named pipe). Every domain object implements `IToDTO<T>` and `IToSerializeDTO`, providing a `ToDTO()` → struct and a `ToSerilizeDTO()` → `byte[]` shortcut.

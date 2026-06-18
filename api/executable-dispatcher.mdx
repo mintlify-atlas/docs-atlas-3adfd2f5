@@ -234,7 +234,7 @@ The communicator's `OnRecive` event passes every received packet directly to `Te
 ```csharp
 communicator.OnRecive += async (pCapsule) =>
 {
-    Console.Log($"Packet: {pCapsule}");
+    Console.WriteLine($"Packet: {pCapsule}");
     CurrentContext.Value = new InfoLocalThreads
     {
         Communicator = communicator,

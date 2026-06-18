@@ -1,7 +1,7 @@
 ---
 title: "Serialineitor: Fluent Binary Serialization Builder"
 sidebarTitle: "Serialineitor"
-description: "API reference for Serialineitor — the fluent builder for constructing binary payloads, plus static utility methods for serializing unmanaged types and arrays."
+description: "API reference for Serialineitor — the fluent builder for constructing binary payloads, with static helpers for serializing unmanaged types and arrays."
 ---
 
 `Serialineitor` is the primary tool for building binary payloads in Terbin. It provides both a fluent instance API (accumulate values into a growing buffer, then call `Serialize()`) and a collection of static utility methods for one-shot serialization of individual values, arrays, and `IStructSerializable` structs.
@@ -41,15 +41,15 @@ new Serialineitor(byte[]? pInitialContent, int pSize = 2) // start from existing
 
 ### Instance Methods
 
-<ParamField path="Add<T>(T pValue)" type="Serialineitor">
+<ParamField path="Add<T>(T pValue) where T : unmanaged" type="Serialineitor">
   Appends an unmanaged value to the buffer. The buffer auto-grows if needed. Returns `this` for chaining.
 </ParamField>
 
-<ParamField path="AddArray<T>(T[] pArray)" type="Serialineitor">
+<ParamField path="AddArray<T>(T[] pArray) where T : unmanaged" type="Serialineitor">
   Appends a `ThreeQuartersInt` (3-byte) length prefix followed by the raw element bytes. Returns `this` for chaining.
 </ParamField>
 
-<ParamField path="AddStruct<T>(T pStruct)" type="Serialineitor">
+<ParamField path="AddStruct<T>(T pStruct) where T : struct, IStructSerializable" type="Serialineitor">
   Appends an `IStructSerializable` struct by calling `pStruct.WriteTo()`. Returns `this` for chaining.
 </ParamField>
 

@@ -1,7 +1,7 @@
 ---
-title: "Packet Types: Header, PacketRequest, and IdArray"
+title: "Terbin Packet Types: Header, PacketRequest, and IdArray"
 sidebarTitle: "Packets"
-description: "Reference for the core packet types in Terbin's binary protocol: Header struct, PacketRequest, and IdArray action byte sequences."
+description: "Reference for the core packet types in Terbin's binary protocol: Header struct, PacketRequest, IdArray action byte sequences, and ExceptionDTO."
 ---
 
 Every message that flows through a Terbin named pipe is encoded as a `PacketRequest` — a binary struct composed of a fixed-size `Header` for routing metadata, an `IdArray` that identifies the target action handler, and a variable-length `byte[]` payload. This page documents all three types, plus the `ExceptionDTO` struct used to transmit exception details over the wire.

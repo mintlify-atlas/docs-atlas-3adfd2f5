@@ -60,7 +60,7 @@ TerbinService reads its settings from a single JSON file at startup.
 
 ### Location
 
-```
+```text
 TerbinService/config/config.json
 ```
 
@@ -85,7 +85,7 @@ The constants that correspond to each JSON key are defined in `TerbinLibrary.Con
 | `rute_farlands` | `RUTE_FARLANDS` | `string` (path) | Recommended | Absolute path to the Farlands game installation directory (the folder that contains `Farlands.exe`). Auto-detected from Steam on first run if omitted. |
 | `rute_instances` | `RUTE_INSTANCES` | `string` (path) | Yes | Directory where Terbin creates and manages game instances. Defaults to `<Documents>/TerbinInstances`. |
 | `rute_plugins` | `RUTE_STORAGE_PLUGINS` | `string` (path) | Yes | Plugin storage directory (the central mod cache). Defaults to `<Documents>/TerbinStorage`. |
-| `rute_steam` | `RUTE_STEAM` | `string` (path) | Optional | Override for the Steam root installation path. Used by `ManagerProton` and other Steam helpers when the auto-detection is insufficient. |
+| `rute_steam` | `RUTE_STEAM` | `string` (path) | Optional | Override for the Steam root installation path. Used by `Proton` and other Steam helpers when the auto-detection is insufficient. |
 | `rute_proton` | `RUTE_PROTON` | `string` (path) | Optional | Path to the Proton binary used to launch Windows executables under Linux Steam Play. |
 | `rute_proton_tmp` | `RUTE_PROTON_TMP` | `string` (path) | Optional | Temporary working directory for Proton operations. |
 
@@ -131,15 +131,17 @@ sc.exe start TerbinService
 ```
 
 <Note>
-  On startup, `Worker` uses reflection to scan both `TerbinLibrary` and `TerbinService` for methods decorated with the internal `[TODO]` attribute and prints them to the console. This diagnostic output lets developers see at a glance which features are still pending implementation. It is not an error — it is intentional.
+  On startup, `Worker` uses reflection to scan both `TerbinLibrary` and `TerbinService` for types and members decorated with the `[TODO]` attribute and prints them to the console. This diagnostic output lets developers see at a glance which features are still pending implementation. It is not an error — it is intentional.
 
-  ```
+  ```text
   Por Hacer TerbinLibrary:
-    [TODO] NodeUtil.CloneDirectory — (Verano)Permitira actualizar farlands ...
-    ...
+  TerbinCommunicator:
+  	<TerbinCommunicator> TODO: Hay Muchos, Revisar
+  	...
   Por Hacer TerbinService:
-    [TODO] ManagerConfiguration — Que el json no sea un Dictionary<string, string>...
-    ...
+  Manager:
+  	<Manager> TODO: Que el json no sea un Dictionary<string, string>...
+  	...
   ```
 </Note>
 
@@ -192,7 +194,7 @@ dotnet run --project SimulateClient
 
 If the pipe is up you will see:
 
-```
+```text
 [Client] ¡Conectado!
 ```
 

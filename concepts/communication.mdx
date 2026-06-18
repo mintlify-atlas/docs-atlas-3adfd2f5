@@ -1,5 +1,5 @@
 ---
-title: "Named-Pipe Communication with TerbinCommunicator"
+title: "Named-Pipe IPC in Terbin: TerbinCommunicator Guide"
 sidebarTitle: "Communication"
 description: "How TerbinCommunicator manages named-pipe connections, packet queuing, concurrent send/receive loops, and request-response correlation."
 ---
@@ -82,7 +82,7 @@ public async Task<PacketRequest?> Send(
     ushort? pId = null)
 ```
 
-Enqueues the packet and returns immediately. If the payload is small enough (≤ `MAX_PLD`) this returns `null`. If fragmentation is required and the handshake or memory allocation fails, the returned `PacketRequest` contains the error status.
+Enqueues the packet and returns immediately. Returns `null` when the payload fits in a single packet (≤ `MAX_PLD`). If fragmentation is required and the `CheckExecution` handshake or memory allocation fails, the returned `PacketRequest` carries the error status — otherwise `null` is also returned on successful fragmentation.
 
 ### `SendBytes()`
 

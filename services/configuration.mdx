@@ -24,7 +24,7 @@ The following keys are defined as constants in `TerbinConfiguration` and are rec
 | `TerbinConfiguration.RUTE_PROTON_TMP` | `rute_proton_tmp` | Temporary directory used by Proton at runtime. | No — must be set manually |
 
 <Info>
-  On first startup, `Manager.Configuration` calls `setPredeterminatedConfig()` which auto-detects and persists `rute_farlands`, `rute_instances`, and `rute_plugins`. The Steam and Proton keys have no automatic defaults and will return `AccesNullOrNotExist` until configured. The source also notes a TODO to manage Steam/Proton installation state and to move instances when their path changes.
+  On first startup, `Manager.Configuration` calls `setPredeterminatedConfig()` which auto-detects and persists `rute_farlands`, `rute_instances`, and `rute_plugins`. The Steam and Proton keys have no automatic defaults. Until they are explicitly set via `UpdateRute`, calling `ReadRute` for those keys will cause `Manager.Configuration.GetConfg` to throw an unhandled exception (the predeterminated lookup returns `null`, and `GetConfg` throws rather than returning `null`). The source also notes a TODO to manage Steam/Proton installation state and to move instances when their path changes.
 </Info>
 
 ---
@@ -50,7 +50,7 @@ The response `Status` field indicates the result:
 | `CodeStatus` | Meaning |
 |---|---|
 | `Succes` | Key found. The payload is a length-prefixed UTF-16 char array of the configured path. |
-| `AccesNullOrNotExist` | The key is not configured and has no default. Payload is empty. |
+| `AccesNullOrNotExist` | The key was present in the dictionary but resolved to `null`. In practice this is not reached for the three auto-detected keys (they always have a default), and for the Steam/Proton keys `GetConfg` throws rather than returning `null` — so avoid calling `ReadRute` for `rute_steam`, `rute_proton`, or `rute_proton_tmp` before they have been set via `UpdateRute`. |
 | `ErrorNotPayload` | The request payload was empty or the deserialized key string was empty. |
 
 <ResponseField name="value" type="char[]">

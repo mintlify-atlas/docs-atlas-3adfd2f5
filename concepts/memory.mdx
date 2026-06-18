@@ -1,7 +1,7 @@
 ---
 title: "Terbin In-Memory Fragment Assembly with TerbinMemory"
 sidebarTitle: "Memory"
-description: "How TerbinMemory stores, orders, and reassembles byte fragments for large payloads that exceed the single-packet size limit."
+description: "How TerbinMemory stores byte fragments, TerbinMemoryManager manages the slot pool, and TerbinMemoryHelper assembles payloads on the receive path."
 ---
 
 When a Terbin sender has a payload larger than `MAX_PLD` (65,520 bytes), it splits the data into chunks and streams each chunk as a separate packet with an incrementing `OrderRequest` index. The receiver must accumulate these fragments in the correct order and reassemble them into the original byte stream before dispatching the handler. The memory subsystem — `TerbinMemory`, `TerbinMemoryManager`, and `TerbinMemoryHelper` — is responsible for the entire receive-side fragment lifecycle.
@@ -34,7 +34,7 @@ A `TerbinMemory` instance represents one reassembly slot. Internally it holds a 
 public void AddFragment(ushort pOrder, byte[] pData)
 ```
 
-Stores a fragment under its `OrderRequest` key. Duplicate order values are silently ignored (the first arrival wins). Increments `_totalSize` by the fragment length. Fires `OnAdd` after insertion.
+Stores a fragment under its `OrderRequest` key. Duplicate order values are silently ignored inside the lock (the first arrival wins) and `_totalSize` is only incremented for new entries. `OnAdd` fires unconditionally after the lock block — even if the fragment was a duplicate — so subscribers must not assume a new fragment was actually stored.
 
 ### `TryGetFullData(out byte[] data)`
 
@@ -74,7 +74,7 @@ Discards all fragment entries and resets `_totalSize` to zero. Thread-safe via `
 
 | Event | When it fires |
 |---|---|
-| `OnAdd` | After each successful `AddFragment` call |
+| `OnAdd` | After every `AddFragment` call (including duplicate-key calls that did not store a new fragment) |
 | `OnRelease` | During `Release()`, before `Clear()` |
 
 ## `TerbinMemoryManager` — The Slot Pool
@@ -89,7 +89,7 @@ public static byte GetFreeStore()
 
 Scans `_containers` for any slot where `IsOcupated == false`. If one exists, returns its ID immediately. If all existing slots are occupied, creates a new `TerbinMemory` instance with a fresh `MiniID.NewB` byte identifier, adds it to the dictionary, and returns the new ID.
 
-This is called by `TerbinExecutor.Solicit` when the remote side sends `CodeStatus.Execute` with `IdMemory = CodeTerbinMemory.New`.
+This is called by `TerbinExecutor.Solicit` when an incoming packet carries `IdMemory = CodeTerbinMemory.New` — the standard fragmentation handshake sends `CodeTerbinProtocol.Solicit` as the action key to trigger this handler.
 
 ### Storing Fragments — `Store()` and `OverwriteStore()`
 

@@ -1,7 +1,7 @@
 ---
 title: "Error Code Enums: TerbinErrorCode, AppError, ErrorFlags"
 sidebarTitle: "Error Codes"
-description: "Reference for Terbin's typed error code enums — TerbinErrorCode, AppError, ErrorFlags, and ExceptionFlags — used for structured error handling across the framework."
+description: "Reference for Terbin typed error enums — TerbinErrorCode, AppError, ErrorFlags, and ExceptionFlags — for structured error handling."
 ---
 
 Terbin defines multiple complementary error-code enums, each targeting a different layer of the stack. `TerbinErrorCode` is the low-level protocol enum serialised over the wire as a `ushort`. `AppError` covers higher-level business-logic failures as a `long`. `ErrorFlags` and `ExceptionFlags` are bitflag enums that let you combine multiple simultaneous error conditions into a single value for rich diagnostics. Together they provide a fully typed, code-based error system without relying on string parsing or exception message inspection.

@@ -22,7 +22,7 @@ public static string? GetGamePath(int pAppId)
 
 1. Calls the private `GetSteamLibraries()` iterator to discover all library roots.
 2. For each library root, constructs the path to the ACF manifest:
-   ```
+   ```text
    <library>/steamapps/appmanifest_<appId>.acf
    ```
 3. Reads the manifest line by line looking for the `"installdir"` key.
@@ -64,7 +64,7 @@ string? farlandsPath = SteamLocator.GetGamePath(ManagerFarlands.KEY_FARLANDS);
 ```
 
 <Note>
-  On Linux, `GetSteamLibraries()` checks both the legacy `~/.steam/steam` symlink path and the modern `~/.local/share/Steam` data directory. Proton acts as a compatibility layer between these Steam libraries and Windows executables — see the [Proton](#managerproton) section below for how TerbinService handles Proton-launched instances.
+  On Linux, `GetSteamLibraries()` checks both the legacy `~/.steam/steam` symlink path and the modern `~/.local/share/Steam` data directory. Proton acts as a compatibility layer between these Steam libraries and Windows executables — see the [Proton](#proton) section below for how TerbinService handles Proton-launched instances.
 </Note>
 
 ---
@@ -182,7 +182,7 @@ public static bool IsOpenSteam
 
 ---
 
-## ManagerProton
+## Proton
 
 `TerbinService.Valve.Proton` provides the basic scaffolding for launching Windows game executables through the Proton compatibility layer on Linux.
 

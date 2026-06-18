@@ -136,7 +136,7 @@ Called by the `TerbinCommunicator` constructor to complete the two-way wiring:
 
 `TerbinExecutableHelper` contains the reflection logic that both `ExecutableDispatcher.RegisterFromAssembly` and `TerbinExecutableManagerSimple.RegisterFromAssembly` delegate to. You will not normally call it directly, but understanding it clarifies what happens during the scan.
 
-### `RegisterFromAssembly<TAttr, TDispatcher>`
+### `RegisterFromAssembly<T, E>`
 
 ```csharp
 public static void RegisterFromAssembly<T, E>(Assembly pAssembly, E pExecutor)
@@ -146,7 +146,7 @@ public static void RegisterFromAssembly<T, E>(Assembly pAssembly, E pExecutor)
 
 Iterates over every type in `pAssembly`, then over every `public`, `non-public`, and `static` method, looking for custom attributes of type `T`. For each match it:
 
-1. Skips methods that also carry `[Obsolete]` (with a yellow console warning).
+1. Prints a yellow console warning for methods that also carry `[Obsolete]`, but continues to register them.
 2. Calls `IsFirmParameters` — validates that the method has exactly three parameters: `Header`, `byte[]`, `CancellationToken`.
 3. Calls `IsFirmReturn` — validates that the return type is `Task<InfoResponse?>`.
 4. If both checks pass, creates a typed delegate via `Delegate.CreateDelegate`.
@@ -227,7 +227,7 @@ return null;
 
 ## Registration Flow Diagram
 
-```
+```text
 Worker.ExecuteAsync()
   └─ TerbinExecutor.Register(Assembly.GetExecutingAssembly())
        └─ TerbinExecutableManager.RegisterFromAssembly(assembly)

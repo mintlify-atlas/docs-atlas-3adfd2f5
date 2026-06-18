@@ -55,7 +55,7 @@ if (result is Task task)
 
   <Step title="Confirm connection">
     On a successful connection you will see:
-    ```
+    ```text
     [Client] ¡Conectado!
     -------( Start )---------
     [Client] "Clase -Accion"
@@ -66,9 +66,9 @@ if (result is Task task)
 </Steps>
 
 <Tip>
-  The entire interactive block in `SimulateClient/Program.cs` is wrapped in a `#if true … #else … #endif` gate. If you change the `#if true` to `#if false`, the project will compile and run but will immediately print:
+  The entire interactive block in `SimulateClient/Program.cs` is wrapped in a `#if false … #else … #endif` gate. The disabled message lives in the first (`#if false`) branch; the active client code is in the `#else` branch. If you swap the gate to `#if true`, the first branch becomes active and the project will compile and run but will immediately print:
 
-  ```
+  ```text
   SimulateClient esta desactivado.
   Ponga en false el if para activarlo.
   ```
@@ -80,7 +80,7 @@ if (result is Task task)
 
 ## Command Format
 
-```
+```text
 ClassName -MethodName
 ```
 
@@ -91,7 +91,7 @@ ClassName -MethodName
 
 **Exit keywords** — type any of the following to disconnect and quit:
 
-```
+```text
 exit   ex   sa   salir   q
 ```
 
@@ -161,7 +161,7 @@ exit   ex   sa   salir   q
 
 ## Example Session
 
-```
+```text
 -------( Start )---------
 [Client] "Clase -Accion"
 Command -> ( Inst -Create )

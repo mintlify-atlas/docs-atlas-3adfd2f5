@@ -1,7 +1,7 @@
 ---
 title: "Terbin: Named-Pipe Mod Management Framework for Farlands"
 sidebarTitle: "Introduction"
-description: "Terbin is a C# framework for building mod management background services using named-pipe IPC, a binary packet protocol, and a reflection-based executable dispatcher."
+description: "Terbin is a C# framework for mod management services using named-pipe IPC, binary packet serialization, and a reflection-based command dispatcher."
 ---
 
 Terbin is a C# framework designed to power background services for the Farlands modding ecosystem. It solves the problem of safely routing mod-management commands — installing plugins, managing instances, querying game paths — between a long-running Windows service and any number of client tools, without requiring the service to poll or ask its clients for information it already holds. Communication happens over OS-level named pipes using a compact binary packet protocol, and every command handler is discovered and wired up automatically at startup through a reflection-based dispatcher. The result is a system where adding a new command is as simple as decorating a static method with `[TerbinExecutable]`.
@@ -10,7 +10,7 @@ Terbin is a C# framework designed to power background services for the Farlands 
 
 Terbin is organized into three C# projects that sit inside the `TerbinProyect.sln` solution:
 
-- **TerbinLibrary** — The core SDK. It contains the communication layer (`TerbinCommunicator`), the binary packet types (`Header`, `PacketRequest`, `IdArray`, `InfoResponse`), the protocol constants (`TerbinProtocol`), the fragmentation/memory subsystem (`TerbinMemoryManager`), and the entire execution-dispatch pipeline (`TerbinExecutableAttribute`, `TerbinExecutableManager`, `TerbinExecutor`). Almost everything you import in your own project comes from here.
+- **TerbinLibrary** — The core SDK. It contains the communication layer (`TerbinCommunicator`), the binary packet types (`Header`, `PacketRequest`, `IdArray`, `InfoResponse`), the protocol constants (`TerbinProtocol`), the binary serialization helpers (`Serialineitor`, `BufferWriter`, `BufferReader`), the fragmentation/memory subsystem (`TerbinMemory`, `TerbinMemoryManager`), and the entire execution-dispatch pipeline (`TerbinExecutableAttribute`, `TerbinExecutableManager`, `TerbinExecutor`). Almost everything you import in your own project comes from here.
 
 - **TerbinService** — The background service host. It runs as a .NET Generic Host (`Worker : BackgroundService`) and immediately begins listening on a named pipe called `TerbinPipe`. It contains a set of **Managers** that own business logic and mutable state (plugins, instances, games, configuration, the manifest index, the plugin storage), a set of thin **Services** that act as IPC dispatch handlers delegating to those managers, and **Valve helpers** (`ManagerSteam`, `ManagerProton`, `ManagerFarlands`) for Steam/Proton integration and Farlands game launching.
 
@@ -52,4 +52,5 @@ Terbin is built around three ideas:
 - **Request/response correlation** — `Communicate()` returns a `Task<PacketRequest>` that resolves when the matching response packet arrives, identified by a `ushort` request ID. Timeouts are enforced via `MaximumResponseTime` (default 8 seconds).
 - **Fire-and-forget sends** — `Send()` enqueues a packet without registering a pending reply, making it suitable for progress updates and notifications.
 - **Multi-client server** — The `OnNewClientConnect` event lets the server spin up a new `TerbinCommunicator` instance for each connecting client, enabling concurrent sessions.
+- **Binary serialization helpers** — `Serialineitor` provides static methods for serializing and deserializing primitives, arrays, and enums to/from `byte[]`. `BufferWriter` and `BufferReader` supply low-level `Span<byte>`-backed read/write helpers used by every `IStructSerializable` implementation (`PacketRequest`, `IdArray`) in the protocol layer.
 - **Farlands-aware managers** — Built-in managers for plugins, mod instances, game paths, BepInEx injection, Steam/Proton detection, and configuration backed by `config.json`.

@@ -1,7 +1,7 @@
 ---
-title: "Binary Serialization: Serialineitor, BufferWriter, and BufferReader"
+title: "Terbin Binary Serialization: Serialineitor and Buffers"
 sidebarTitle: "Serialization"
-description: "How Terbin serializes and deserializes unmanaged types, arrays, and IStructSerializable structs using Span-based zero-allocation APIs."
+description: "Zero-allocation binary serialization in Terbin: Serialineitor fluent builder, Span-based BufferWriter and BufferReader, IStructSerializable interface."
 ---
 
 Terbin transmits all data as raw binary over named pipes. The serialization layer is designed around three goals: **zero heap allocation on the hot path**, **`Span<byte>`-based reads and writes**, and **explicit control over layout** via the `IStructSerializable` interface. Every packet, header, and payload is encoded and decoded through the APIs described on this page.

@@ -1,7 +1,7 @@
 ---
-title: "BufferReader and BufferWriter: Low-Level Span API"
+title: "BufferReader and BufferWriter: Low-Level Span Buffer API"
 sidebarTitle: "Buffer Reader/Writer"
-description: "API reference for BufferReader and BufferWriter — the low-level Span-based APIs for reading and writing unmanaged types, arrays, and IStructSerializable structs into byte buffers."
+description: "API reference for BufferReader and BufferWriter — low-level Span APIs for reading and writing unmanaged types, arrays, and IStructSerializable structs."
 ---
 
 `BufferWriter` and `BufferReader` are the low-level building blocks that `Serialineitor` delegates to internally. Use them directly when you need precise control over a pre-allocated `Span<byte>` or `ReadOnlySpan<byte>` without the auto-growing overhead of the builder.
@@ -14,19 +14,19 @@ description: "API reference for BufferReader and BufferWriter — the low-level 
 
 ### Methods
 
-<ParamField path="Add<T>(Span<byte> pBuffer, ref int pOffset, T pValue)" type="void">
+<ParamField path="Add<T>(Span<byte> pBuffer, ref int pOffset, T pValue) where T : unmanaged" type="void">
   Writes a single unmanaged value at `pOffset` and advances `pOffset` by `sizeof(T)`.
 </ParamField>
 
-<ParamField path="AddArray<T>(Span<byte> pBuffer, ref int pOffset, T[] pArray)" type="void">
+<ParamField path="AddArray<T>(Span<byte> pBuffer, ref int pOffset, T[] pArray) where T : unmanaged" type="void">
   Writes a `ThreeQuartersInt` (3-byte) length header followed by the raw element bytes. Throws `ArgumentOutOfRangeException` if the buffer is too small.
 </ParamField>
 
-<ParamField path="AddStruct<T>(Span<byte> pBuffer, ref int pOffset, T pStruct)" type="void">
+<ParamField path="AddStruct<T>(Span<byte> pBuffer, ref int pOffset, T pStruct) where T : struct, IStructSerializable" type="void">
   Writes an `IStructSerializable` struct by calling `pStruct.WriteTo()`.
 </ParamField>
 
-<ParamField path="EnsureAdd<T>(ref byte[] buffer, int offset, T value)" type="void">
+<ParamField path="EnsureAdd<T>(ref byte[] buffer, int offset, T value) where T : unmanaged" type="void">
   Writes an unmanaged value into a `byte[]`, auto-resizing the array (doubling + `sizeof(T)`) if needed. Use when you do not know the required capacity upfront.
 </ParamField>
 
@@ -94,15 +94,15 @@ Prefer the slicing `ref Span<byte>` variants in hot paths to avoid managing a se
 
 ### Methods
 
-<ParamField path="Get<T>(ReadOnlySpan<byte> pBuffer, ref int pOffset)" type="T">
+<ParamField path="Get<T>(ReadOnlySpan<byte> pBuffer, ref int pOffset) where T : unmanaged" type="T">
   Reads a single unmanaged value at `pOffset` and advances `pOffset` by `sizeof(T)`.
 </ParamField>
 
-<ParamField path="GetArray<T>(ReadOnlySpan<byte> pBuffer, ref int pOffset)" type="T[]">
+<ParamField path="GetArray<T>(ReadOnlySpan<byte> pBuffer, ref int pOffset) where T : unmanaged" type="T[]">
   Reads a `ThreeQuartersInt` length header, then reads that many bytes and casts them to `T[]`. Advances `pOffset` past both the header and the data.
 </ParamField>
 
-<ParamField path="GetStruct<T>(ReadOnlySpan<byte> pBuffer, ref int pOffset, T pStruct)" type="T">
+<ParamField path="GetStruct<T>(ReadOnlySpan<byte> pBuffer, ref int pOffset, T pStruct) where T : struct, IStructSerializable" type="T">
   Deserializes a struct by calling `Serialineitor.DeserializeStructRaw` on a slice starting at `pOffset`, then advances `pOffset` by `pStruct.GetSize()`.
 </ParamField>
 

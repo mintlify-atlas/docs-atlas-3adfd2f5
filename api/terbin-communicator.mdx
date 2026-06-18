@@ -336,7 +336,7 @@ public async Task<PacketRequest?> HandleSendFragment(
     CodeStatus pStatus)
 ```
 
-Handles payloads that exceed `TerbinProtocol.MAX_PLD` by splitting them into `FRAGMENT_IN`-byte (0xFFAA) chunks, requesting a remote memory slot via `SoliciteRequestMemory()`, uploading each fragment via `Load()`, and then sending the final packet.
+Handles payloads that exceed `TerbinProtocol.MAX_PLD` by splitting them into chunks of `TerbinProtocol.FRAGMENT_IN` bytes (65,450 bytes, `0xFFAA`), requesting a remote memory slot via `SoliciteRequestMemory()`, uploading each fragment via `Load()`, and then sending the final packet.
 
 <ResponseField name="return" type="Task&lt;PacketRequest?&gt;">
   `null` on success. Returns an error packet if `CheckExecution` fails, memory cannot be allocated, or the packet count exceeds `TerbinProtocol.FINAL_PACKET`.
@@ -448,6 +448,37 @@ Directly enqueues a pre-built `PacketRequest` into the outbound send queue and s
   A fully constructed packet ready to be transmitted.
 </ParamField>
 
+An overload builds and enqueues the packet from individual header fields, which is how the internal send pipeline calls it:
+
+```csharp
+public async Task addQueue(
+    ushort pOrderRequest,
+    CodeStatus pStatus,
+    IdArray pActionMethod,
+    byte pIdMemory,
+    byte[] pSectionPayload,
+    ushort pIdRequest)
+```
+
+<ParamField path="pOrderRequest" type="ushort" required>
+  Fragment order (`TerbinProtocol.ORDER_SINGLE` for unfragmented, `1` for first fragment, `ushort.MaxValue` for last).
+</ParamField>
+<ParamField path="pStatus" type="CodeStatus" required>
+  The status code to stamp into the header.
+</ParamField>
+<ParamField path="pActionMethod" type="IdArray" required>
+  The action routing key for the packet.
+</ParamField>
+<ParamField path="pIdMemory" type="byte" required>
+  Memory slot identifier. Use `(byte)CodeTerbinMemory.NotAsign` for non-fragmented packets.
+</ParamField>
+<ParamField path="pSectionPayload" type="byte[]" required>
+  The raw bytes to carry as the packet payload.
+</ParamField>
+<ParamField path="pIdRequest" type="ushort" required>
+  The request ID to stamp into the header.
+</ParamField>
+
 ---
 
 ## Static Pipe Helpers
@@ -541,7 +572,7 @@ if (response.Head.Status == CodeStatus.Succes)
 `TerbinCommunicator` implements `IDisposable`. Always dispose the instance (or use a `using` block) to close the pipe and release stream resources.
 
 ```csharp
-await using var communicator = new TerbinCommunicator(false, cts.Token);
+using var communicator = new TerbinCommunicator(false, cts.Token);
 await communicator.Connect();
 // ... use communicator ...
 // Disposed automatically at end of scope

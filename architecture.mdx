@@ -31,9 +31,19 @@ TerbinLibrary is the core SDK and the only project that the other two reference.
   - `TerbinExecutableManager` — Static façade over `ExecutableDispatcher` providing `Register`, `Unregister`, `DispatchAsync`, and `RegisterFromAssembly`.
   - `TerbinExecutor` — Bootstrapper that calls `RegisterInternal()` (registering the library's own built-in handlers: `Load`, `Solicit`, `Prolong`, `Response`) and exposes `Register(Assembly)` for application-level handlers.
 
-- **`TerbinLibrary.Memory`** — `TerbinMemoryManager` manages numbered in-memory slots used for large-payload fragmentation. The communicator stores fragments in these slots by slot ID until the final fragment arrives, then reassembles the full payload before handing it to `OnRecive`.
+- **`TerbinLibrary.Memory`** — Three classes cooperate for large-payload fragmentation:
+  - `TerbinMemory` — An individual slot that holds an ordered collection of byte fragments and can reassemble them into a complete payload.
+  - `TerbinMemoryManager` — A static registry of `TerbinMemory` slots, keyed by `byte` ID, with `GetFreeStore`, `Store`, `OverwriteStore`, `TryGetResult`, and `Release` operations.
+  - `TerbinMemoryHelper` — Stateless helpers invoked by `TerbinCommunicator.handleReceive` to detect whether an incoming packet belongs to a fragmented sequence (`TryGetMemoryStream`) and to release a slot after reassembly (`TryReleaseMemory`).
 
-- **`TerbinLibrary`** (root) — `CodeServices`, `CodeServicesSection`, `CodeStatus`, `InternalErrors`, and `TerbinErrorCode` enumerations that define the vocabulary for service/section routing and error reporting.
+- **`TerbinLibrary.Configuration`** — `TerbinConfiguration` holds the canonical config-key constants (`RUTE_FARLANDS`, `RUTE_INSTANCES`, `RUTE_STORAGE_PLUGINS`, `RUTE_STEAM`, `RUTE_PROTON`, `RUTE_PROTON_TMP`) used by `Manager.Configuration` when reading and writing `config.json`.
+
+- **`TerbinLibrary.Serialize`** — Binary serialization utilities:
+  - `Serialineitor` — Static helpers for serializing/deserializing primitives, arrays, and enums to/from `byte[]`.
+  - `BufferWriter` / `BufferReader` — Low-level `Span<byte>`-backed helpers used by `IStructSerializable.WriteTo` and `ReadFrom` implementations.
+  - `IStructSerializable` — Interface (defined in `Serialineitor.cs`) implemented by `PacketRequest` and `IdArray`; requires `GetSize()`, `WriteTo(Span<byte>)`, and `ReadFrom(ReadOnlySpan<byte>)`.
+
+- **`TerbinLibrary`** (root) — `CodeServices`, `CodeServicesSection`, `InternalErrors`, and related enumerations that define the vocabulary for service/section routing and error reporting. (`CodeStatus` and `TerbinErrorCode` are defined in `TerbinLibrary.Protocol`.)
 
 ---
 
@@ -50,6 +60,7 @@ TerbinService is the background daemon. It is a .NET Generic Host application wi
 | `ManagerGames` | Track Farlands game installations and launch the game |
 | `ManagerConfiguration` | Read and write `config.json` (game path, instance path, plugin storage path) |
 | `ManagerIndex` | Maintain the manifest index across all registered instances |
+| `ManagerManifest` | Create, update, and remove per-instance and per-plugin manifest entries |
 | `ManegerStoragePlugin` | Manage the centralized plugin storage directory |
 | `ManagerInjectors` | Handle BepInEx injector installation and state |
 | `ManagerNode` | Manage node-based dependency trees |
@@ -72,15 +83,20 @@ TerbinService is the background daemon. It is a .NET Generic Host application wi
 | `ManagerProton` | Detect and configure Proton compatibility layers |
 | `ManagerFarlands` | Launch the Farlands executable (wraps Steam/Proton paths) |
 
-Configuration is read from `TerbinService/config/config.json`:
+Configuration is read from `TerbinService/config/config.json`. The three core keys (`rute_farlands`, `rute_instances`, `rute_plugins`) are written on first run if absent; the Steam and Proton keys are populated automatically when the service detects those installations:
 
 ```json
 {
-  "rute_farlands": "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Farlands",
-  "rute_instances": "C:\\Users\\PC\\Documents\\TerbinInstances",
-  "rute_plugins": "C:\\Users\\PC\\Documents\\TerbinStorage"
+  "rute_farlands":   "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Farlands",
+  "rute_instances":  "C:\\Users\\PC\\Documents\\TerbinInstances",
+  "rute_plugins":    "C:\\Users\\PC\\Documents\\TerbinStorage",
+  "rute_steam":      "C:\\Program Files (x86)\\Steam",
+  "rute_proton":     "/home/user/.steam/steam/steamapps/common/Proton",
+  "rute_proton_tmp": "/tmp/proton-run"
 }
 ```
+
+The key constants are defined in `TerbinLibrary.Configuration.TerbinConfiguration` (`RUTE_FARLANDS`, `RUTE_INSTANCES`, `RUTE_STORAGE_PLUGINS`, `RUTE_STEAM`, `RUTE_PROTON`, `RUTE_PROTON_TMP`) and consumed by `Manager.Configuration.GetConfg(string pKey)`.
 
 File-system constants (manifest file names, BepInEx plugin paths) live in `TerbinServiceConst`:
 
@@ -122,7 +138,7 @@ PacketRequest response = await communicator.Communicate(action, payloadBytes);
 
 Inside `send()`, the payload length is compared to `TerbinProtocol.MAX_PLD` (`0xFFF0` = 65,520 bytes):
 
-- **Fits in one packet** → `HandleSendSingle` enqueues a `PacketRequest` with `OrderRequest = TerbinProtocol.ORDER_SINGLE` (0).
+- **Fits in one packet** → `HandleSendSigle` enqueues a `PacketRequest` with `OrderRequest = TerbinProtocol.ORDER_SINGLE` (0).
 - **Too large** → `HandleSendFragment` first sends a `CheckExecution` probe, then requests a memory slot from the server via `SoliciteRequestMemory()`, uploads the fragments one by one with `Load()`, and finally enqueues the last fragment with `OrderRequest = TerbinProtocol.FINAL_PACKET` (`ushort.MaxValue`).
 
 ```csharp
@@ -187,6 +203,13 @@ public static async Task<InfoResponse?> Response(
     Header pHead, byte[] pParameters, CancellationToken pToken)
 {
     if (pToken.IsCancellationRequested) return null;
+    if (pHead.Status == CodeStatus.ExecutionException)
+    {
+        // Deserialize and print the remote exception; do not unblock any pending request.
+        ExceptionDTO dto = (ExceptionDTO)new ExceptionDTO().Read(pParameters);
+        Console.Error(dto.ToString());
+        return null;
+    }
     _communicator?.GiveResponse(
         new PacketRequest(pHead, new IdArray((byte)CodeTerbinProtocol.Response), pParameters));
     return null;
@@ -219,9 +242,17 @@ TerbinProyect/
 │   │   ├── TerbinExecutableHelper.cs      # Assembly scan + signature validation
 │   │   └── TerbinExecutor.cs              # Bootstrap + built-in handlers
 │   ├── Memory/
-│   │   └── TerbinMemoryManager.cs         # Fragmentation slot store
+│   │   ├── TerbinMemory.cs                # Single fragmentation slot
+│   │   ├── TerbinMemoryHelper.cs          # Reassembly + release helpers
+│   │   └── TerbinMemoryManager.cs         # Static slot registry
 │   ├── Protocol/
 │   │   └── TerbinProtocol.cs              # Constants + CodeStatus + CodeTerbinProtocol
+│   ├── Configuration/
+│   │   └── TerbinConfiguration.cs         # Config-key string constants
+│   ├── Serialize/
+│   │   ├── Serialineitor.cs               # IStructSerializable interface + primitive/array serialization
+│   │   ├── BufferWriter.cs                # Span<byte> write helpers
+│   │   └── BufferReader.cs                # Span<byte> read helpers
 │   ├── CodeServices.cs                    # Service/section routing enums
 │   └── Useful/
 │       └── PluginUtil.cs                  # Version-string extraction helper
@@ -238,6 +269,7 @@ TerbinProyect/
 │   │   ├── ManagerGames.cs
 │   │   ├── ManagerConfiguration.cs
 │   │   ├── ManagerIndex.cs
+│   │   ├── ManagerManifest.cs
 │   │   ├── ManegerStoragePlugin.cs
 │   │   ├── ManagerInjectors.cs
 │   │   └── ManagerNode.cs

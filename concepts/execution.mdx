@@ -1,7 +1,7 @@
 ---
-title: "Reflection-Based Executable Dispatcher in Terbin"
+title: "Terbin Executable Dispatcher and Packet Action Routing"
 sidebarTitle: "Execution"
-description: "How the [TerbinExecutable] attribute, ExecutableDispatcher, and TerbinExecutableManager route incoming packets to handler methods by byte-sequence action keys."
+description: "How [TerbinExecutable], TerbinExecutor, and TerbinExecutableManager route incoming packets to static handler methods via byte-sequence action keys."
 ---
 
 When a packet arrives at a Terbin server, `TerbinCommunicator` calls the `OnRecive` event, which (in a typical setup) calls `TerbinExecutableManager.DispatchAsync`. The dispatcher looks up the packet's `IdArray` action key in a `ConcurrentDictionary` and invokes every handler registered for that key. This wiring is done entirely through reflection by scanning for methods decorated with `[TerbinExecutable]`.

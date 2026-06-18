@@ -1,5 +1,5 @@
 ---
-title: "Terbin Binary Packet Protocol and Fragmentation"
+title: "Terbin Binary Packet Protocol: Layout and Fragmentation"
 sidebarTitle: "Protocol"
 description: "How Terbin's binary packet protocol works: packet layout, size limits, fragmentation into memory slots, and the constants that govern them."
 ---
@@ -133,6 +133,12 @@ Used in the `Header.IdMemory` field to communicate memory slot semantics:
 ## `CodeStatus` Enum
 
 `CodeStatus` is a `short`-backed enum inspired by HTTP status codes. It is carried in `Header.Status` and controls how the dispatcher and communicator respond to each packet.
+
+<Accordion title="Sentinel / Unassigned">
+  | Value | Code | Description |
+  |---|---|---|
+  | `NotAsign` | -1 | Uninitialized or unassigned status; used internally as a default sentinel value |
+</Accordion>
 
 <Accordion title="Informational (1xx)">
   | Value | Code | Description |

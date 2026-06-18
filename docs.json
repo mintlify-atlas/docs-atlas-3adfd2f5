@@ -1,72 +1,104 @@
 {
   "$schema": "https://mintlify.com/docs.json",
-  "theme": "mint",
-  "name": "Mintlify Starter Kit",
+  "name": "Terbin",
+  "theme": "aspen",
   "colors": {
-    "primary": "#16A34A",
-    "light": "#07C983",
-    "dark": "#15803D"
-  },
-  "favicon": "/favicon.svg",
-  "navigation": {
-    "pages": [
-      {
-        "group": "Getting Started",
-        "pages": [
-          "index",
-          "quickstart"
-        ]
-      }
-    ],
-    "global": {
-      "anchors": [
-        {
-          "anchor": "Documentation",
-          "href": "https://mintlify.com/docs",
-          "icon": "book-open-cover"
-        },
-        {
-          "anchor": "Blog",
-          "href": "https://mintlify.com/blog",
-          "icon": "newspaper"
-        }
-      ]
-    }
-  },
-  "logo": {
-    "light": "/logo/light.svg",
-    "dark": "/logo/dark.svg"
+    "primary": "#3B6FD4",
+    "light": "#EEF3FF",
+    "dark": "#1A2E5A"
   },
   "navbar": {
-    "links": [
-      {
-        "label": "Support",
-        "href": "mailto:hi@mintlify.com"
-      }
-    ],
     "primary": {
-      "type": "button",
-      "label": "Dashboard",
-      "href": "https://app.mintlify.com"
+      "type": "github",
+      "href": "https://github.com/FarlandsModdingTeam/TerbinProyect"
     }
-  },
-  "contextual": {
-    "options": [
-      "copy",
-      "view",
-      "chatgpt",
-      "claude",
-      "perplexity",
-      "mcp",
-      "cursor",
-      "vscode"
-    ]
   },
   "footer": {
     "socials": {
-      "x": "https://x.com/mintlify",
-      "github": "https://github.com/mintlify",
-      "linkedin": "https://linkedin.com/company/mintlify"
+      "github": "https://github.com/FarlandsModdingTeam/TerbinProyect"
     }
+  },
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Getting Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "architecture"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/communication",
+              "concepts/protocol",
+              "concepts/execution",
+              "concepts/memory",
+              "concepts/serialization"
+            ]
+          },
+          {
+            "group": "Services",
+            "pages": [
+              "services/instances",
+              "services/plugins",
+              "services/plugin-storage",
+              "services/games",
+              "services/configuration"
+            ]
+          },
+          {
+            "group": "Configuration & Deployment",
+            "pages": [
+              "guides/setup",
+              "guides/simulate-client",
+              "guides/steam-proton"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Communication",
+            "pages": [
+              "api/terbin-communicator",
+              "api/packets",
+              "api/info-response"
+            ]
+          },
+          {
+            "group": "Execution",
+            "pages": [
+              "api/terbin-executable-attribute",
+              "api/executable-dispatcher",
+              "api/terbin-executor"
+            ]
+          },
+          {
+            "group": "Data & Serialization",
+            "pages": [
+              "api/serialineitor",
+              "api/buffer-reader-writer",
+              "api/terbin-memory",
+              "api/manifests"
+            ]
+          },
+          {
+            "group": "Enumerations & Status Codes",
+            "pages": [
+              "api/code-status",
+              "api/code-services",
+              "api/error-codes"
+            ]
+          }
+        ]
+      }
+    ]
   }
 }

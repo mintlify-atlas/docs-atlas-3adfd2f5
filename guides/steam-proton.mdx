@@ -1,0 +1,250 @@
+---
+title: "Steam and Proton Integration in TerbinService"
+sidebarTitle: "Steam & Proton"
+description: "How TerbinService locates Farlands via Steam, detects Proton installations, and uses SteamLocator to find game paths from manifest files."
+---
+
+TerbinService includes a set of integration helpers for locating and launching Farlands through Steam and Proton. These live under the `TerbinService/Valve/` and `TerbinLibrary/SteamFarlands/` directories and cover everything from reading Steam library manifests to launching a game through the `steam://` protocol URL or a Proton compatibility layer binary.
+
+---
+
+## SteamLocator
+
+`TerbinLibrary.SteamFarlands.SteamLocator` is the low-level path resolver. Given a Steam AppID it walks every Steam library on the machine and returns the game's installation directory.
+
+### `GetGamePath(int appId)`
+
+```csharp
+public static string? GetGamePath(int pAppId)
+```
+
+**How it works:**
+
+1. Calls the private `GetSteamLibraries()` iterator to discover all library roots.
+2. For each library root, constructs the path to the ACF manifest:
+   ```
+   <library>/steamapps/appmanifest_<appId>.acf
+   ```
+3. Reads the manifest line by line looking for the `"installdir"` key.
+4. Returns `<library>/steamapps/common/<installdir>` on the first match, or `null` if the game is not found in any library.
+
+```csharp
+var manifest = Path.Combine(library, "steamapps", $"appmanifest_{pAppId}.acf");
+
+foreach (var line in File.ReadLines(manifest))
+{
+    if (line.Contains("installdir"))
+    {
+        var dir = line.Split('"')[3];
+        return Path.Combine(library, "steamapps", "common", dir);
+    }
+}
+```
+
+### Library discovery
+
+`GetSteamLibraries()` finds library roots differently on each platform:
+
+- **Windows** — reads `HKEY_CURRENT_USER\Software\Valve\Steam` → `SteamPath` from the Windows registry.
+- **Linux** — checks `~/.steam/steam` and `~/.local/share/Steam`.
+
+In both cases it then parses the `steamapps/libraryfolders.vdf` file in each root, extracting every `"path"` entry to include additional library locations (e.g. games installed on a secondary drive).
+
+### Farlands AppID constant
+
+```csharp
+// ManagerFarlands.cs
+public const int KEY_FARLANDS = 2252680;
+```
+
+Pass this constant to `GetGamePath` to resolve the Farlands install directory:
+
+```csharp
+string? farlandsPath = SteamLocator.GetGamePath(ManagerFarlands.KEY_FARLANDS);
+```
+
+<Note>
+  On Linux, `GetSteamLibraries()` checks both the legacy `~/.steam/steam` symlink path and the modern `~/.local/share/Steam` data directory. Proton acts as a compatibility layer between these Steam libraries and Windows executables — see the [Proton](#managerproton) section below for how TerbinService handles Proton-launched instances.
+</Note>
+
+---
+
+## ManagerFarlands
+
+`TerbinLibrary.SteamFarlands.ManagerFarlands` is the high-level game management helper. All members are `static`.
+
+<AccordionGroup>
+  <Accordion title="LaunchGame(string path) — launch directly">
+    ```csharp
+    public static bool LaunchGame(string pPath)
+    ```
+    Launches the executable at `pPath` using `Process.Start` with `UseShellExecute = true` and the executable's own directory as `WorkingDirectory`. Returns `false` if the path is empty or the file does not exist; returns `true` if the process started successfully.
+
+    Typical use: launching a modded instance from an absolute path.
+
+    ```csharp
+    bool ok = ManagerFarlands.LaunchGame(
+        @"C:\Users\PC\Documents\TerbinInstances\MyInstance\Farlands.exe");
+    ```
+  </Accordion>
+
+  <Accordion title="LaunchFarlandsBySteam() — launch via Steam protocol">
+    ```csharp
+    public static bool LaunchFarlandsBySteam()
+    ```
+    Opens the `steam://run/2252680` protocol URL, which tells the Steam client to launch Farlands through its own launcher (respecting Steam overlay, cloud saves, etc.).
+
+    Before opening the URL it calls `SteamLocator.GetGamePath(KEY_FARLANDS)` to verify the game is installed. Returns `false` if Farlands cannot be located; `true` if Steam was instructed to launch it.
+
+    ```csharp
+    Process.Start(new ProcessStartInfo
+    {
+        FileName = "steam://run/2252680",
+        UseShellExecute = true
+    });
+    ```
+  </Accordion>
+
+  <Accordion title="IsFarlands(string dir) — validate installation directory">
+    ```csharp
+    public static bool IsFarlands(string pDir)
+    ```
+    Returns `true` if `pDir` exists as a directory **and** contains `Farlands.exe` at its root. Use this before trusting a user-supplied path.
+
+    ```csharp
+    if (!ManagerFarlands.IsFarlands(userPath))
+        return InfoResponse.Create(head.IdRequest, CodeStatus.ErrorNotPayload);
+    ```
+  </Accordion>
+
+  <Accordion title="GetVersion() — read file version from the executable">
+    ```csharp
+    public static string GetVersion()
+    ```
+    Reads `FileVersionInfo` from `Farlands.exe` via `FileVersionInfo.GetVersionInfo(path)` and returns `FileVersion ?? ProductVersion ?? "0.0.0"`. Returns an empty string if the game cannot be located or the file is missing.
+
+    <Note>
+      `GetVersion()` currently reads the Unity engine version embedded in the executable rather than the game's own version. This is a known issue tracked with a `[TODO]` annotation in the source.
+    </Note>
+  </Accordion>
+
+  <Accordion title="GetRuteSteamFarlands() — resolve the Steam install path">
+    ```csharp
+    public static string? GetRuteSteamFarlands()
+    ```
+    Delegates directly to `SteamLocator.GetGamePath(KEY_FARLANDS)`. This is the canonical way for the rest of the service to obtain the Farlands installation path without coupling to `SteamLocator` directly.
+
+    `Manager.Configuration` calls this method when building the default `config.json` on first run.
+  </Accordion>
+
+  <Accordion title="GetDirectorySize(string path) — sum file sizes recursively">
+    ```csharp
+    public static long GetDirectorySize(string pPath)
+    ```
+    Enumerates every file under `pPath` recursively and sums their `FileInfo.Length` values. Individual I/O exceptions on locked or inaccessible files are silently swallowed so the method always returns a best-effort total in bytes.
+  </Accordion>
+
+  <Accordion title="GetDLCs(string manifestPath) — parse DLC AppIDs from an ACF manifest">
+    ```csharp
+    public static List<string> GetDLCs(string pManifestPath)
+    ```
+    Reads the ACF manifest at `pManifestPath` line by line and collects every quoted key that can be parsed as an integer. In the Steam ACF format the DLC section contains numeric AppID keys as quoted strings, so this extraction logic captures them without a full VDF parser.
+
+    ```csharp
+    foreach (var line in File.ReadLines(pManifestPath))
+    {
+        if (line.Trim().StartsWith("\"") && line.Contains("\""))
+        {
+            var parts = line.Split('"');
+            if (parts.Length > 1 && int.TryParse(parts[1], out _))
+                dlcs.Add(parts[1]);
+        }
+    }
+    ```
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Steam Static Class
+
+`TerbinService.Valve.Steam` provides a single process-detection property:
+
+```csharp
+public static bool IsOpenSteam
+{
+    get => Process.GetProcessesByName("steam").Length > 0 ||
+           Process.GetProcessesByName("steamwebhelper").Length > 0;
+}
+```
+
+`IsOpenSteam` returns `true` if either the main `steam` process or the `steamwebhelper` subprocess is currently running. Use this as a guard before attempting protocol URL launches or Proton invocations that require the Steam client to be active.
+
+---
+
+## ManagerProton
+
+`TerbinService.Valve.Proton` provides the basic scaffolding for launching Windows game executables through the Proton compatibility layer on Linux.
+
+```csharp
+public static class Proton
+{
+    private static string _rute_proton = "";
+
+    public static bool LauncheGame(string pPath)
+    {
+        var p = Process.Start(new ProcessStartInfo
+        {
+            FileName = _rute_proton,
+            ArgumentList = { "run", pPath }
+        });
+        return true;
+    }
+
+    public static bool FindProton(out string pPathProton)
+    {
+        pPathProton = "";
+        // detection logic
+        return true;
+    }
+}
+```
+
+- **`LauncheGame(string pPath)`** — invokes Proton with the `run <path>` arguments to execute a Windows binary through the compatibility layer. The Proton binary path is stored in `_rute_proton`, which is populated from the `rute_proton` configuration key.
+- **`FindProton(out string pPathProton)`** — stub for automatic Proton installation detection. Returns the detected path via the `out` parameter.
+
+<Note>
+  On Linux, Steam installs Proton as a versioned tool inside the Steam library (e.g. `~/.steam/steam/steamapps/common/Proton 9.0`). TerbinService's Proton helpers are designed to detect these installations automatically and use the configured `rute_proton` path as an override when automatic detection is insufficient.
+</Note>
+
+---
+
+## Configuration Keys Reference
+
+The Steam and Proton helpers read their paths from `TerbinService/config/config.json` via `Manager.Configuration.GetConfg(...)`. The relevant keys and their `TerbinConfiguration` constants are:
+
+| JSON key | Constant | Used by |
+|---|---|---|
+| `rute_steam` | `TerbinConfiguration.RUTE_STEAM` | Steam library path override for `SteamLocator` / `Proton` |
+| `rute_proton` | `TerbinConfiguration.RUTE_PROTON` | Path to the Proton binary (`Proton.LauncheGame`) |
+| `rute_proton_tmp` | `TerbinConfiguration.RUTE_PROTON_TMP` | Temporary directory for Proton Wine prefix operations |
+| `rute_farlands` | `TerbinConfiguration.RUTE_FARLANDS` | Authoritative Farlands install path (auto-set from `GetRuteSteamFarlands()`) |
+
+`Manager.Configuration` stores a `Dictionary<string, string>` in `config/config.json`. The Steam-related keys are optional — if they are absent, `GetPredeterminated(key)` returns `null` for them because no automatic default exists for `rute_steam`, `rute_proton`, or `rute_proton_tmp`:
+
+```csharp
+public static string? GetPredeterminated(string pKey)
+{
+    return pKey switch
+    {
+        TerbinConfiguration.RUTE_FARLANDS          => ManagerFarlands.GetRuteSteamFarlands(),
+        TerbinConfiguration.RUTE_INSTANCES         => MakePathInstances(),
+        TerbinConfiguration.RUTE_STORAGE_PLUGINS   => MakePathStorage(),
+        _ => null   // rute_steam, rute_proton, rute_proton_tmp fall here
+    };
+}
+```
+
+<Warning>
+  Always use the configured base paths from `TerbinConfiguration` rather than hardcoding absolute paths in manifests or service code. Absolute paths baked into ACF manifests or instance records will break across machines and user profiles. Use `Manager.Configuration.GetConfg(TerbinConfiguration.RUTE_FARLANDS)` and combine it with `Path.Combine(...)` to build concrete paths at runtime.
+</Warning>

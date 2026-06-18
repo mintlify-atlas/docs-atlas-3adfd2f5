@@ -1,0 +1,226 @@
+---
+title: "Plugin Storage Service: Query the Plugin Registry"
+sidebarTitle: "Plugin Storage"
+description: "ServicePluginStorage provides read and delete access to the global plugin storage registry, independent of any specific instance."
+---
+
+`ServicePluginStorage` is a static handler class that exposes read and delete operations against the global plugin storage registry — the centralized catalog of every plugin archive that has been downloaded to the local machine. Unlike `ServicePlugins`, which operates within the scope of a specific game instance, this service is concerned only with the **storage layer**: the `.zip` archives on disk and their corresponding `ReferencePluginStore` index entries.
+
+## Storage vs Instance Layer
+
+Understanding how these two layers relate is important when building clients:
+
+| Concept | Class | Scope | Key ID |
+|---|---|---|---|
+| **Plugin Storage** | `ReferencePluginStore` | Global — one entry per downloaded archive | `Id` (Guid, assigned at download) |
+| **Installed Plugin** | `ManifestPlugin` + `ReferencePlugin` | Per-instance — one entry per installation | `IdLocal` (Guid, assigned at install) |
+
+A single `ReferencePluginStore` entry (with a given `Id`) can be installed into multiple instances, each installation generating a different `IdLocal`. When you delete a storage entry, you remove the physical `.zip` archive and its registry entry — any instance that previously installed from that archive retains its extracted files but loses the ability to reinstall from the cached archive.
+
+<Note>
+  The storage index is persisted in a hidden JSON file (`ManifestIndexStorage`) inside the configured `rute_plugins` directory. The manifest is managed exclusively by `Manager.StoragePlugin`.
+</Note>
+
+## Data Models
+
+### ReferencePluginStore
+
+The canonical on-disk and in-index model for a stored plugin archive.
+
+| Field | Type | Description |
+|---|---|---|
+| `Name` | `string?` | Human-readable name extracted from the archive filename by `Manager.Node.GetNameByFile`. |
+| `Id` | `string?` | Unique `Guid` (N-format) assigned at download time. |
+| `FileName` | `string?` | The filename of the stored archive (e.g., `MyMod-1.2.3.zip`). |
+| `UrlWeb` | `string?` | Original download URL (may be `null` if the archive was imported manually). |
+| `Version` | `string?` | Version string extracted from the filename by `PluginUtil.ExtratVersion`. |
+
+### ReferencePluginStoreDTO (wire format)
+
+The serialized transport struct used in all responses from this service.
+
+| Field | Type | Wire encoding |
+|---|---|---|
+| `Name` | `string?` | Length-prefixed UTF-16 char array |
+| `Id` | `string?` | Length-prefixed UTF-16 char array |
+| `FileName` | `string?` | Length-prefixed UTF-16 char array |
+| `UrlWeb` | `string?` | Length-prefixed UTF-16 char array |
+| `Version` | `string?` | Length-prefixed UTF-16 char array |
+
+### ManifestIndexStorage
+
+The root object of the on-disk storage index (not transmitted directly over IPC — clients receive `ReferencePluginStoreDTO` structs).
+
+| Field | Type | Description |
+|---|---|---|
+| `NameGame` | `string?` | Name of the target game (always `"Farlands"` for default init). |
+| `KeySteam` | `int?` | Steam App ID used to identify the game. |
+| `References` | `List<ReferencePluginStore>` | The list of all stored plugins. |
+
+---
+
+## Operations
+
+<Accordion title="GetAll (ReadAll) — (CodeServices.ReadAll, CodeServicesSection.PluginStorage)">
+
+Returns all entries in the global plugin storage registry by calling `Manager.StoragePlugin.GetAll()`, which deserializes the `ManifestIndexStorage` JSON file and returns its `References` list.
+
+<Note>
+  Despite the method being named `GetOne` in the source file (`ServicePluginStorage.cs`), it is decorated with `[TerbinExecutable((byte)CodeServices.ReadAll, ...)]` and behaves as a full list operation.
+</Note>
+
+**Action bytes:** `(byte)CodeServices.ReadAll`, `(byte)CodeServicesSection.PluginStorage` = `21`
+
+### Request Payload
+
+_None required._ Any bytes sent are ignored.
+
+### Response Payload
+
+If no plugins are stored, the response contains a single zero byte (`[0]`).
+
+Otherwise:
+
+<ResponseField name="count" type="ThreeQuartersInt">
+  Number of entries in the storage registry.
+</ResponseField>
+
+<ResponseField name="plugins[]" type="ReferencePluginStoreDTO[]">
+  Array of `count` consecutive `ReferencePluginStoreDTO` structs. Each contains `Name`, `Id`, `FileName`, `UrlWeb`, and `Version`.
+</ResponseField>
+
+### Example
+
+```csharp
+var response = await client.Communicate(
+    (byte)CodeServices.ReadAll,
+    (byte)CodeServicesSection.PluginStorage,
+    Array.Empty<byte>()
+);
+
+if (response.Status == CodeStatus.Succes && response.Payload.Length > 1)
+{
+    ReadOnlySpan<byte> reader = response.Payload;
+    int count = reader.Read<ThreeQuartersInt>();
+    for (int i = 0; i < count; i++)
+    {
+        ReferencePluginStoreDTO dto = reader.ReadStruct<ReferencePluginStoreDTO>();
+        Console.WriteLine($"[{dto.Id}] {dto.Name} v{dto.Version} — {dto.FileName}");
+    }
+}
+```
+
+</Accordion>
+
+<Accordion title="GetOne (Read) — (CodeServices.Read, CodeServicesSection.PluginStorage)">
+
+Fetches a single storage entry by its `Id` (Guid) by calling `Manager.StoragePlugin.Get(id)`, which iterates the storage index and returns the matching `ReferencePluginStore`.
+
+<Note>
+  The method is named `GetAll` in the source file, but it is decorated with `[TerbinExecutable((byte)CodeServices.Read, ...)]` and accepts a single `id` to return one entry.
+</Note>
+
+**Action bytes:** `(byte)CodeServices.Read`, `(byte)CodeServicesSection.PluginStorage` = `21`
+
+### Request Payload
+
+<ParamField body="id" type="char[]" required>
+  The `Id` (Guid in N-format, no hyphens) of the plugin storage entry to retrieve, encoded as a length-prefixed UTF-16 char array.
+</ParamField>
+
+### Response Payload
+
+On success the entire body is a serialized `ReferencePluginStoreDTO`:
+
+<ResponseField name="Name" type="string">Human-readable plugin name.</ResponseField>
+<ResponseField name="Id" type="string">Storage Guid in N-format.</ResponseField>
+<ResponseField name="FileName" type="string">Archive filename on disk.</ResponseField>
+<ResponseField name="UrlWeb" type="string">Original download URL (may be empty).</ResponseField>
+<ResponseField name="Version" type="string">Version string extracted from the filename.</ResponseField>
+
+### Error Conditions
+
+| `InternalErrors` value | Code | Meaning |
+|---|---|---|
+| `PluginNotExist` | `205` | No entry with the given `Id` was found in the storage registry. |
+
+### Example
+
+```csharp
+string pluginId = "a1b2c3d4e5f647a8b9c0d1e2f3a4b5c6"; // Guid N-format
+
+Serialineitor s = new();
+s.AddArray<char>(pluginId.ToCharArray());
+
+var response = await client.Communicate(
+    (byte)CodeServices.Read,
+    (byte)CodeServicesSection.PluginStorage,
+    s.Serialize()
+);
+
+if (response.Status == CodeStatus.Succes)
+{
+    ReferencePluginStoreDTO dto = new();
+    dto.ReadFrom(response.Payload);
+    Console.WriteLine($"{dto.Name} — {dto.FileName}");
+}
+```
+
+</Accordion>
+
+<Accordion title="Delete — (CodeServices.Deleted, CodeServicesSection.PluginStorage)">
+
+Permanently deletes a plugin from the global storage registry. Internally the service calls `Manager.Plugin.DeletedOne(id, token)`, which in turn calls `Manager.StoragePlugin.Eliminate(id)`. `Eliminate` physically deletes the archive file from disk and removes the `ReferencePluginStore` entry from the `ManifestIndexStorage` JSON.
+
+**Action bytes:** `(byte)CodeServices.Deleted`, `(byte)CodeServicesSection.PluginStorage` = `21`
+
+### Request Payload
+
+<ParamField body="id" type="char[]" required>
+  The `Id` (Guid N-format) of the plugin storage entry to delete.
+</ParamField>
+
+### Response
+
+On success the response body is **empty**.
+
+On failure the response body contains the `InternalErrors` code serialized as a `ushort` (2 bytes, little-endian).
+
+### Error Conditions
+
+| `InternalErrors` value | Code | Meaning |
+|---|---|---|
+| `PluginNotExist` | `205` | The `Id` was not found in the storage registry (`Eliminate` returned `null`). |
+| `PluginOnRemove` | `211` | The archive file existed but could not be deleted, or the index update failed (`Eliminate` returned `false`). |
+
+<Warning>
+  Deleting a storage entry only removes the cached archive. Any instance that previously installed this plugin retains its extracted files. However, reinstallation from the `InstallPlugin` endpoint will fail for that `Id` until the plugin is downloaded again.
+</Warning>
+
+### Example
+
+```csharp
+string pluginId = "a1b2c3d4e5f647a8b9c0d1e2f3a4b5c6";
+
+Serialineitor s = new();
+s.AddArray<char>(pluginId.ToCharArray());
+
+var response = await client.Communicate(
+    (byte)CodeServices.Deleted,
+    (byte)CodeServicesSection.PluginStorage,
+    s.Serialize()
+);
+
+if (response.Status == CodeStatus.Succes)
+{
+    Console.WriteLine("Plugin archive removed from storage.");
+}
+else
+{
+    // Decode the ushort error code from the response body
+    ushort errorCode = Serialineitor.Deserialize<ushort>(response.Payload);
+    Console.WriteLine($"Error: {(InternalErrors)errorCode}");
+}
+```
+
+</Accordion>

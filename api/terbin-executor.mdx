@@ -1,0 +1,256 @@
+---
+title: "TerbinExecutor: Assembly Scanner and Handler Registration"
+sidebarTitle: "TerbinExecutor"
+description: "Reference for TerbinExecutor — the static class that scans assemblies for [TerbinExecutable] methods and wires them into TerbinExecutableManager."
+---
+
+`TerbinExecutor` is the bridge between your code and Terbin's packet routing engine. It provides two things: a one-line startup call (`Register`) that scans any assembly for `[TerbinExecutable]`-decorated methods and feeds them into `TerbinExecutableManager`, and an `Init` method that connects a `TerbinCommunicator` so that response packets can be routed back through `GiveResponse`. In practice, most services only ever call `TerbinExecutor.Register(Assembly.GetExecutingAssembly())` once at startup and let the attribute-based declarative system handle the rest.
+
+<Tip>
+  Call `TerbinExecutor.Register` before starting the communicator, or at minimum before the first packet can arrive. Handlers that are not yet registered when a packet is dispatched will receive a `CodeStatus.ActionNotFound` response.
+</Tip>
+
+---
+
+## `TerbinExecutor` (static class)
+
+```csharp
+public static class TerbinExecutor
+```
+
+`TerbinExecutor` holds a single nullable `TerbinCommunicator?` reference (`_communicator`) that is populated by `Init`. All other behaviour is stateless — the routing state lives inside `TerbinExecutableManager`.
+
+---
+
+### `Register`
+
+```csharp
+public static void Register(Assembly pAssembly)
+```
+
+Scans `pAssembly` for static methods decorated with `[TerbinExecutable]` and registers them into `TerbinExecutableManager`. This is the primary public entry point for application-level handler registration.
+
+<ParamField path="pAssembly" type="Assembly" required>
+  The assembly to scan. Pass `Assembly.GetExecutingAssembly()` from your service's `Worker` or startup code.
+</ParamField>
+
+Internally delegates to:
+
+```csharp
+TerbinExecutableManager.RegisterFromAssembly(pAssembly);
+```
+
+**Usage in `Worker.cs`:**
+
+```csharp
+protected override async Task ExecuteAsync(CancellationToken pStoppingToken)
+{
+    Cts = CancellationTokenSource.CreateLinkedTokenSource(pStoppingToken);
+    TerbinExecutor.Register(Assembly.GetExecutingAssembly());
+    await autoCreatePipe(Cts.Token);
+}
+```
+
+---
+
+### `RegisterInternal`
+
+```csharp
+public static void RegisterInternal()
+```
+
+Registers the built-in protocol handlers that live inside `TerbinLibrary` itself — `Load`, `Solicit`, `Prolong`, `Response`, etc. Called automatically by `Init`. You do not need to call this manually; it is documented here for completeness.
+
+```csharp
+// Internally:
+TerbinExecutableManager.RegisterFromAssembly(Assembly.GetExecutingAssembly());
+//  ^ "GetExecutingAssembly()" here refers to TerbinLibrary, not your service.
+```
+
+---
+
+### `Init`
+
+```csharp
+public static void Init(TerbinCommunicator pCommunicator)
+```
+
+Called by the `TerbinCommunicator` constructor to complete the two-way wiring:
+
+1. Calls `RegisterInternal()` to ensure the library's own protocol handlers are loaded.
+2. Stores the communicator reference so the built-in `Response` handler can call `pCommunicator.GiveResponse(...)` when a response packet arrives.
+
+<ParamField path="pCommunicator" type="TerbinCommunicator" required>
+  The active communicator instance. After `Init`, the `Response` handler forwards response packets back to any in-flight request awaiting a reply.
+</ParamField>
+
+---
+
+### Built-in Protocol Handlers
+
+`TerbinExecutor` itself carries several `[TerbinExecutable]`-decorated static methods for core protocol operations:
+
+<Accordion title="Load — CodeTerbinProtocol.Load (2)">
+  Stores incoming payload fragments in `TerbinMemoryManager`. Handles both ordered fragments (`OrderRequest > 0`) and single-shot overwrites (`OrderRequest == 0`). Returns `null` (no reply required for data loads).
+
+  ```csharp
+  [TerbinExecutable((byte)CodeTerbinProtocol.Load)]
+  public static async Task<InfoResponse?> Load(
+      Header pHead, byte[] pParameters, CancellationToken pToken)
+  ```
+</Accordion>
+
+<Accordion title="Solicit — CodeTerbinProtocol.Solicit (4)">
+  When `pHead.IdMemory == CodeTerbinMemory.New`, allocates a free memory slot and returns its ID as a single-byte payload. Used by clients to request a fresh memory region before sending fragmented data.
+
+  ```csharp
+  [TerbinExecutable((byte)CodeTerbinProtocol.Solicit)]
+  public static async Task<InfoResponse?> Solicit(
+      Header pHead, byte[] pParameters, CancellationToken pToken)
+  ```
+</Accordion>
+
+<Accordion title="Prolong — CodeTerbinProtocol.Prolong (3)">
+  Deserializes a `ushort` request ID from the payload and calls `_communicator?.GiveProlong(id)` to extend the timeout window of an in-flight request. Returns `null`.
+
+  ```csharp
+  [TerbinExecutable((byte)CodeTerbinProtocol.Prolong)]
+  public static async Task<InfoResponse?> Prolong(
+      Header pHead, byte[] pParameters, CancellationToken pToken)
+  ```
+</Accordion>
+
+<Accordion title="Response — CodeTerbinProtocol.Response (1)">
+  Handles response packets coming back from the remote side. If `pHead.Status == CodeStatus.ExecutionException` the exception DTO is deserialized and printed to the error console. Otherwise the packet is forwarded to `_communicator?.GiveResponse(...)` so the caller's `await` can complete.
+
+  ```csharp
+  [TerbinExecutable((byte)CodeTerbinProtocol.Response)]
+  public static async Task<InfoResponse?> Response(
+      Header pHead, byte[] pParameters, CancellationToken pToken)
+  ```
+</Accordion>
+
+---
+
+## `TerbinExecutableHelper` (static utility class)
+
+`TerbinExecutableHelper` contains the reflection logic that both `ExecutableDispatcher.RegisterFromAssembly` and `TerbinExecutableManagerSimple.RegisterFromAssembly` delegate to. You will not normally call it directly, but understanding it clarifies what happens during the scan.
+
+### `RegisterFromAssembly<TAttr, TDispatcher>`
+
+```csharp
+public static void RegisterFromAssembly<T, E>(Assembly pAssembly, E pExecutor)
+    where T : Attribute, IExecutableAttribute
+    where E : IExecutableDispatcher
+```
+
+Iterates over every type in `pAssembly`, then over every `public`, `non-public`, and `static` method, looking for custom attributes of type `T`. For each match it:
+
+1. Skips methods that also carry `[Obsolete]` (with a yellow console warning).
+2. Calls `IsFirmParameters` — validates that the method has exactly three parameters: `Header`, `byte[]`, `CancellationToken`.
+3. Calls `IsFirmReturn` — validates that the return type is `Task<InfoResponse?>`.
+4. If both checks pass, creates a typed delegate via `Delegate.CreateDelegate`.
+5. Calls `pExecutor.Register(attr, (h, b, ct) => del(h, b, ct))` for every attribute instance on the method (supporting `AllowMultiple`).
+
+**Signature validation methods:**
+
+```csharp
+public static bool IsFirmParameters(ParameterInfo[] pParameters)
+{
+    return
+    (
+        pParameters.Length == 3 &&
+        pParameters[0].ParameterType == typeof(Header) &&
+        pParameters[1].ParameterType == typeof(byte[]) &&
+        pParameters[2].ParameterType == typeof(CancellationToken)
+    );
+}
+
+public static bool IsFirmReturn(MethodInfo pMethod)
+{
+    return
+    (
+        pMethod.ReturnType == typeof(Task<InfoResponse?>)
+    );
+}
+```
+
+A method that fails either check is **silently skipped** — no exception is thrown. If you register a handler and it never appears to be called, verify that its signature matches `TerbinExecutableDelegate` exactly.
+
+---
+
+### `ExecutionList`
+
+```csharp
+public static async Task<InfoResponse?> ExecutionList(
+    List<TerbinExecutableDelegate> pHandlers,
+    Header pHead,
+    byte[] pPayload,
+    CancellationTokenSource pToken)
+```
+
+Invoked by `ExecutableDispatcher.DispatchAsync` when at least one handler is registered for a key. All handlers are started concurrently; `Task.WhenAny` is used in a loop to process completions in order. The first handler that returns a non-null `InfoResponse` short-circuits the loop — the result is returned immediately and remaining tasks are abandoned.
+
+<ParamField path="pHandlers" type="List&lt;TerbinExecutableDelegate&gt;" required>
+  The ordered list of delegates registered for the action key.
+</ParamField>
+
+<ParamField path="pHead" type="Header" required>
+  Forwarded unchanged to every handler.
+</ParamField>
+
+<ParamField path="pPayload" type="byte[]" required>
+  Forwarded unchanged to every handler.
+</ParamField>
+
+<ParamField path="pToken" type="CancellationTokenSource" required>
+  The per-action CTS. `pToken.Token` is passed to every handler so all of them share the same cancellation scope.
+</ParamField>
+
+```csharp
+// Simplified flow:
+var pendingTasks = handlers.Select(h => h(pHead, pPayload, pToken.Token)).ToList();
+
+while (pendingTasks.Count > 0)
+{
+    var completed = await Task.WhenAny(pendingTasks);
+    pendingTasks.Remove(completed);
+
+    var result = await completed;
+    if (result != null)
+        return result;   // First non-null wins
+}
+return null;
+```
+
+---
+
+## Registration Flow Diagram
+
+```
+Worker.ExecuteAsync()
+  └─ TerbinExecutor.Register(Assembly.GetExecutingAssembly())
+       └─ TerbinExecutableManager.RegisterFromAssembly(assembly)
+            └─ ExecutableDispatcher.RegisterFromAssembly(assembly)
+                 └─ TerbinExecutableHelper.RegisterFromAssembly<TerbinExecutableAttribute, ExecutableDispatcher>(assembly, dispatcher)
+                      ├─ For each [TerbinExecutable] method with valid signature:
+                      │     dispatcher.Register(attr, delegate)
+                      │       ├─ _handlers[key].Add(delegate)
+                      │       └─ _activeExecutionsByAction[key] = new CancellationTokenSource()
+                      └─ (invalid signatures are silently skipped)
+```
+
+---
+
+## `TerbinExecutableManagerSimple` (obsolete)
+
+<Note>
+  `TerbinExecutableManagerSimple` is a simpler single-byte-key variant of the registration system, backed by `ExecutableDispatcherSimple`. It uses a `ConcurrentDictionary<byte, …>` instead of `ConcurrentDictionary<ByteArrayKey, …>` and supports only a single action byte rather than multi-byte composite keys. Both classes are marked `[Obsolete]` and most of their methods throw `NotImplementedException`. They exist for historical reference only — use `TerbinExecutableManager` and `ExecutableDispatcher` for all new code.
+</Note>
+
+---
+
+## See Also
+
+- [`[TerbinExecutable]` Attribute](/api/terbin-executable-attribute) — how to annotate handler methods.
+- [ExecutableDispatcher](/api/executable-dispatcher) — the thread-safe routing engine that stores and invokes handlers.

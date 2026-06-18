@@ -1,0 +1,151 @@
+---
+title: "TerbinMemory and TerbinMemoryManager: Fragment Buffer Pool"
+sidebarTitle: "TerbinMemory"
+description: "API reference for TerbinMemory and TerbinMemoryManager — managing fragment buffer slots for large payload reassembly in the Terbin protocol."
+---
+
+When a payload exceeds `TerbinProtocol.MAX_PLD` (65,520 bytes), Terbin splits it into fragments and sends them as separate packets. The receiver side uses `TerbinMemory` slots — managed by `TerbinMemoryManager` — to accumulate those fragments before reassembling the complete payload. Application code does not need to interact with these classes directly; `TerbinCommunicator` handles the entire lifecycle automatically.
+
+<Note>
+Slots with IDs ≤ `TerbinProtocol.RESERVE_MEMORY` (9) are reserved for internal protocol operations. `TerbinMemoryHelper.TryReleaseMemory` refuses to release reserved slots.
+</Note>
+
+---
+
+## TerbinMemory
+
+A single fragment accumulation slot.
+
+### Properties
+
+<ResponseField name="Id" type="byte">
+  The slot's identifier, assigned when the slot is created in the pool.
+</ResponseField>
+
+<ResponseField name="IdRequest" type="ushort">
+  The request ID currently using this slot. A value of `CodeTerbinMemory.NotAsign` (1) means the slot is free.
+</ResponseField>
+
+<ResponseField name="IsOcupated" type="bool">
+  Computed: `true` when `IdRequest != (ushort)CodeTerbinMemory.NotAsign`.
+</ResponseField>
+
+### Events
+
+<ResponseField name="OnAdd" type="event Action?">
+  Fires after each `AddFragment()` call. Useful for monitoring assembly progress.
+</ResponseField>
+
+<ResponseField name="OnRelease" type="event Action?">
+  Fires when `Release()` is called. Clears `OnAdd` first, then invokes `OnRelease`, then calls `Clear()`.
+</ResponseField>
+
+### Methods
+
+<ParamField path="AddFragment(ushort pOrder, byte[] pData)" type="void">
+  Adds a fragment at the given order index in a thread-safe manner (locks `_fragments`). Duplicate order keys are silently ignored. Fires `OnAdd`.
+</ParamField>
+
+<ParamField path="TryGetFullData(out byte[] pData)" type="(bool succes, TerbinErrorCode typeError)">
+  Sorts all stored fragments by order key, validates there are no gaps in the sequence, then concatenates them into a single `byte[]`. Returns `(true, None)` on success or `(false, OrderMismatch)` if a fragment is missing.
+</ParamField>
+
+<ParamField path="Release()" type="void">
+  Resets `IdRequest` to `NotAsign`, clears `OnAdd`, fires `OnRelease`, and calls `Clear()`.
+</ParamField>
+
+<ParamField path="Clear()" type="void">
+  Discards all stored fragments and resets `_totalSize` to 0. Thread-safe via lock.
+</ParamField>
+
+---
+
+## TerbinMemoryManager (Static)
+
+The global pool of `TerbinMemory` slots backed by a `ConcurrentDictionary<byte, TerbinMemory>`.
+
+```csharp
+public static ConcurrentDictionary<byte, TerbinMemory> Containers { get; }
+```
+
+### Methods
+
+<ParamField path="GetFreeStore()" type="byte">
+  Scans `Containers` for any slot where `IsOcupated == false`. If none is found, creates a new slot with a random byte ID via `MiniID.NewB`. Returns the slot's byte ID.
+</ParamField>
+
+<ParamField path="Store(byte pIdMemory, ushort pOrder, byte[] pData)" type="void">
+  Stores a fragment in the slot identified by `pIdMemory`, creating the slot if it does not exist yet.
+</ParamField>
+
+<ParamField path="ReStore(byte pIdMemory, ushort pOrder, byte[] pData)" type="void">
+  Creates a fresh slot and forcibly replaces any existing entry at `pIdMemory` via `AddOrUpdate`.
+</ParamField>
+
+<ParamField path="OverwriteStore(byte pIdMemory, ushort pOrder, byte[] pData)" type="void">
+  If a slot exists, calls `Clear()` on it and adds the fragment. Otherwise delegates to `Store`.
+</ParamField>
+
+<ParamField path="TryGetResult(byte pIdMemory, out byte[] pData)" type="(bool succes, TerbinErrorCode typeError)">
+  Retrieves the complete reassembled byte array from the slot by calling `TryGetFullData`. Returns `(false, ValueOutOfRange)` if the slot does not exist.
+</ParamField>
+
+<ParamField path="TryGetMemory(byte pIdMemory, out TerbinMemory? pMemory)" type="bool">
+  Returns the raw `TerbinMemory` instance for a slot without reassembling it.
+</ParamField>
+
+<ParamField path="Release(byte pIdMemory)" type="bool">
+  Calls `TerbinMemory.Release()` on the slot, marking it free. Returns `true` if the slot existed.
+</ParamField>
+
+<ParamField path="Remove(byte pIdMemory)" type="bool">
+  Permanently removes the slot from `Containers`. Returns `true` if it was present.
+</ParamField>
+
+---
+
+## TerbinMemoryHelper (Static)
+
+High-level helpers used internally by `TerbinCommunicator.handleReceive`.
+
+### Methods
+
+<ParamField path="TryGetMemoryStream(PacketRequest pCapsule, out byte[] pMemory)" type="TerbinErrorCode">
+  The main entry point for the receive loop.
+  - If `pCapsule.Head.OrderRequest != FINAL_PACKET`: returns the packet's own `Payload` directly (single packet, no memory slot involved).
+  - If `pCapsule.Head.OrderRequest == FINAL_PACKET`: calls `TryAssembleStream`, then `TryReleaseMemory`. Returns `None` on success, `ErrorGetPayloadMemory` or `MemoryReleaseFailed` on errors.
+</ParamField>
+
+<ParamField path="TryAssembleStream(PacketRequest pCapsule, out byte[] pMemory)" type="TerbinErrorCode">
+  Calls `TerbinMemoryManager.TryGetResult` to get the fragments, then concatenates them with `pCapsule.Payload` via `CombinePayload`. Returns the `TerbinErrorCode` from the manager.
+</ParamField>
+
+<ParamField path="CombinePayload(PacketRequest pCapsule, byte[] pBytes)" type="byte[]">
+  Concatenates `pBytes` (previously stored fragments) and `pCapsule.Payload` (the final packet's payload) into a single `byte[]`.
+</ParamField>
+
+<ParamField path="TryReleaseMemory(byte pIdMemory)" type="bool">
+  Refuses to release slots with IDs ≤ `TerbinProtocol.RESERVE_MEMORY` (9). For valid IDs, delegates to `TerbinMemoryManager.Release`.
+</ParamField>
+
+---
+
+## Fragment Lifecycle
+
+```text
+Client                                  Server
+------                                  ------
+SoliciteRequestMemory() ─────────────► Solicit handler assigns slot ID
+◄── idMemory (byte) ──────────────────
+Load(1, idMemory, fragment1) ────────► TerbinMemoryManager.Store(idMemory, 1, fragment1)
+Load(2, idMemory, fragment2) ────────► TerbinMemoryManager.Store(idMemory, 2, fragment2)
+...
+HandleSendSigle(FINAL, pld) ─────────► handleReceive fires
+                                        TryGetMemoryStream assembles all fragments
+                                        OnRecive fires with full payload
+                                        TryReleaseMemory(idMemory)
+```
+
+<Warning>
+If `TryGetFullData` returns `TerbinErrorCode.OrderMismatch`, one or more fragments arrived out of order or are missing. The communicator reports `CodeStatus.ErrorGetPaylaodMemory` back to the sender.
+</Warning>

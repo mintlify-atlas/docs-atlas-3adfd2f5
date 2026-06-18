@@ -1,0 +1,252 @@
+---
+title: "Instance Management Service: Create, Delete, List Game Instances"
+sidebarTitle: "Instances"
+description: "ServiceInstances exposes CRUD operations for Terbin game instances over IPC. Each instance holds its own plugin manifest and filesystem directory."
+---
+
+`ServiceInstances` is a static handler class decorated with `[TerbinExecutable]` attributes that routes IPC calls to `Manager.Instances` and `Manager.Index`. Every game instance is an isolated directory on disk containing a hidden `.TerbinInstaceInformation` folder that stores the instance manifest (`ManifestInstance`) and individual plugin manifests. The global index of all registered instances is tracked in a separate hidden JSON file managed by `Manager.Index`.
+
+## Data Models
+
+### ManifestInstance
+
+The full, on-disk manifest for a single instance. Deserialized from the hidden information folder.
+
+| Field | Type | Description |
+|---|---|---|
+| `Name` | `string?` | Human-readable name of the instance. |
+| `Version` | `string?` | Game version string (populated after `CloneGame`). |
+| `Executable` | `string?` | Relative path to the game executable inside the instance directory. |
+| `Plugins` | `List<ReferencePlugin>` | Lightweight references to every installed plugin manifest. |
+
+### ReferenceInstance
+
+Lightweight index entry stored in the global index, used for listing without loading individual manifests.
+
+| Field | Type | Description |
+|---|---|---|
+| `Name` | `string?` | The instance name. |
+| `OutSide` | `bool?` | Whether the instance directory lives outside the configured `rute_instances` path. |
+| `Path` | `string?` | Absolute or relative path to the instance root directory. |
+
+### ManifestInstanceDTO (wire format)
+
+The serialized transport struct sent over IPC.
+
+| Field | Type | Wire encoding |
+|---|---|---|
+| `Name` | `string?` | Length-prefixed UTF-16 char array |
+| `Version` | `string?` | Length-prefixed UTF-16 char array |
+| `PluginCount` | `ThreeQuartersInt` | Fixed-size 3-byte integer |
+
+### ReferenceInstanceDTO (wire format)
+
+The serialized transport struct used in list responses.
+
+| Field | Type | Wire encoding |
+|---|---|---|
+| `Name` | `string?` | Length-prefixed UTF-16 char array |
+| `OutSide` | `bool?` | `sbyte` (`ToBoolUk`) |
+| `Path` | `string?` | Length-prefixed UTF-16 char array |
+
+---
+
+## Operations
+
+<Accordion title="CreateInstance — (CodeServices.Create, CodeServicesSection.Instances)">
+
+Creates a new instance directory and registers it in the global index. The service calls `Manager.Instances.NewInstance(name, false)`, which creates the directory, writes a blank `ManifestInstance` JSON file, and calls `Manager.Index.RegisterInstance`.
+
+**Action bytes:** `(byte)CodeServices.Create` = `TerbinCRUD.Create`, `(byte)CodeServicesSection.Instances` = `30`
+
+### Request Payload
+
+<ParamField body="name" type="char[]" required>
+  The name of the new instance. Written as a length-prefixed UTF-16 character array via `WriteArray<char>`. Colons (`:`) in the name are replaced with underscores internally.
+</ParamField>
+
+<ParamField body="path" type="char[]">
+  Optional. A custom filesystem path for the instance. Parsed only if the remaining buffer length exceeds `ThreeQuartersInt.Size` bytes after reading `name`. **Currently unused by `Manager.Instances.NewInstance`** (marked TODO in source) — the instance is always created under `rute_instances`.
+</ParamField>
+
+### Response
+
+On success the response body is **empty** (`InfoResponse.CreateSucces` with no payload bytes).
+
+### Error Conditions
+
+| `InternalErrors` value | Code | Meaning |
+|---|---|---|
+| `InstanceCreate` | `306` | `Manager.Instances.NewInstance` returned `false` — the directory already exists, another instance has the same name, or a filesystem error occurred. |
+
+### Example
+
+```csharp
+// Build the payload
+Serialineitor s = new();
+s.AddArray<char>("MyInstance".ToCharArray());
+
+byte[] payload = s.Serialize();
+
+// Send via IPC
+var response = await client.Communicate(
+    (byte)CodeServices.Create,
+    (byte)CodeServicesSection.Instances,
+    payload
+);
+
+if (response.Status == CodeStatus.Succes)
+    Console.WriteLine("Instance created.");
+```
+
+</Accordion>
+
+<Accordion title="DeleteInstances — (CodeServices.Deleted, CodeServicesSection.Instances)">
+
+Deletes an instance by name. The service calls `Manager.Instances.Delete`, which unregisters the instance from the index and then calls `Manager.Node.DinamiteDirectory` to recursively delete the entire instance folder from disk.
+
+**Action bytes:** `(byte)CodeServices.Deleted`, `(byte)CodeServicesSection.Instances` = `30`
+
+### Request Payload
+
+<ParamField body="name" type="char[]" required>
+  The exact name of the instance to delete, encoded as a length-prefixed UTF-16 char array.
+</ParamField>
+
+### Response
+
+On success the response body is **empty**.
+
+### Error Conditions
+
+| `InternalErrors` value | Code | Meaning |
+|---|---|---|
+| `InstanceNotExist` | `302` | No instance with the given name is registered in the index (`Manager.Instances.Status.ErrorNotExist`). |
+| `InstanceIsNotInstance` | `303` | The directory exists but is missing the instance manifest structure (`Status.ErrorIsNotInstance`). |
+| `InstanceUnregister` | `305` | `Manager.Index.UnregisterInstance` returned `false` — the index could not be updated (`Status.ErrorUnregistInstance`). |
+| `NodeDinamite` | `701` | Catch-all for any unrecognised `Status` returned by the manager. |
+
+<Warning>
+  Deletion is **permanent and irreversible**. The directory and all of its contents — game files, installed plugins, and manifests — are removed immediately by `Directory.Delete(..., recursive: true)`.
+</Warning>
+
+### Example
+
+```csharp
+Serialineitor s = new();
+s.AddArray<char>("MyInstance".ToCharArray());
+
+var response = await client.Communicate(
+    (byte)CodeServices.Deleted,
+    (byte)CodeServicesSection.Instances,
+    s.Serialize()
+);
+
+if (response.Status == CodeStatus.Succes)
+    Console.WriteLine("Instance deleted.");
+```
+
+</Accordion>
+
+<Accordion title="GetAllInstances — (CodeServices.ReadAll, CodeServicesSection.Instances)">
+
+Returns a list of all registered instances from `Manager.Index.GetAllInstances()`. No request payload is needed.
+
+**Action bytes:** `(byte)CodeServices.ReadAll` = `TerbinCRUD.ReadAll`, `(byte)CodeServicesSection.Instances` = `30`
+
+### Request Payload
+
+_None required._ Any bytes sent are ignored.
+
+### Response Payload
+
+If no instances are registered the response contains a single zero byte (`[0]`).
+
+Otherwise the response body is:
+
+<ResponseField name="count" type="ThreeQuartersInt">
+  Number of instances in the list (3-byte fixed-size integer).
+</ResponseField>
+
+<ResponseField name="instances[]" type="ReferenceInstanceDTO[]">
+  Array of `count` consecutive `ReferenceInstanceDTO` structs, each containing `Name`, `OutSide`, and `Path`. Read with `ReadStruct<ReferenceInstanceDTO>` in a loop.
+</ResponseField>
+
+### Example
+
+```csharp
+var response = await client.Communicate(
+    (byte)CodeServices.ReadAll,
+    (byte)CodeServicesSection.Instances,
+    Array.Empty<byte>()
+);
+
+if (response.Status == CodeStatus.Succes && response.Payload.Length > 1)
+{
+    ReadOnlySpan<byte> reader = response.Payload;
+    int count = reader.Read<ThreeQuartersInt>();
+    for (int i = 0; i < count; i++)
+    {
+        ReferenceInstanceDTO dto = reader.ReadStruct<ReferenceInstanceDTO>();
+        Console.WriteLine(dto.Name);
+    }
+}
+```
+
+</Accordion>
+
+<Accordion title="GetOne — (CodeServices.Read, CodeServicesSection.Instances)">
+
+Fetches the full `ManifestInstanceDTO` for a single named instance by calling `Manager.Instances.GetManifestByName`.
+
+**Action bytes:** `(byte)CodeServices.Read`, `(byte)CodeServicesSection.Instances` = `30`
+
+### Request Payload
+
+<ParamField body="name" type="char[]" required>
+  The instance name, encoded as a length-prefixed UTF-16 char array.
+</ParamField>
+
+### Response Payload
+
+On success the entire body is a serialized `ManifestInstanceDTO` struct:
+
+<ResponseField name="Name" type="string">
+  Instance name.
+</ResponseField>
+
+<ResponseField name="Version" type="string">
+  Game version string stored in the manifest (empty until a game is cloned in).
+</ResponseField>
+
+<ResponseField name="PluginCount" type="ThreeQuartersInt">
+  Number of plugins currently referenced in the manifest.
+</ResponseField>
+
+### Error Conditions
+
+| `InternalErrors` value | Code | Meaning |
+|---|---|---|
+| `InstanceNotExist` | `302` | No instance was found for the provided name, or the manifest could not be deserialized. |
+
+### Example
+
+```csharp
+Serialineitor s = new();
+s.AddArray<char>("MyInstance".ToCharArray());
+
+var response = await client.Communicate(
+    (byte)CodeServices.Read,
+    (byte)CodeServicesSection.Instances,
+    s.Serialize()
+);
+
+if (response.Status == CodeStatus.Succes)
+{
+    ManifestInstanceDTO dto = new();
+    dto.ReadFrom(response.Payload);
+    Console.WriteLine($"Name={dto.Name}, Version={dto.Version}, Plugins={dto.PluginCount}");
+}
+```
+
+</Accordion>

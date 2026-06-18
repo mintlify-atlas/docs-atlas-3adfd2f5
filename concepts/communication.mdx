@@ -1,0 +1,267 @@
+---
+title: "Named-Pipe Communication with TerbinCommunicator"
+sidebarTitle: "Communication"
+description: "How TerbinCommunicator manages named-pipe connections, packet queuing, concurrent send/receive loops, and request-response correlation."
+---
+
+`TerbinCommunicator` is the central class of the Terbin framework. It wraps a Windows named pipe — either a server-side `NamedPipeServerStream` or a client-side `NamedPipeClientStream` — and drives the complete lifecycle of the connection: accepting a client, queuing outbound packets, reading inbound packets on a background loop, and correlating awaited responses back to their calling code.
+
+## Constructor
+
+```csharp
+public TerbinCommunicator(
+    bool pIsServer = false,
+    CancellationToken pTokenCancellation = default,
+    string pName = "TerbinPipe")
+```
+
+<ParamField path="pIsServer" type="bool" default="false">
+  When `true`, the communicator creates a `NamedPipeServerStream` and immediately begins waiting for the first client connection. When `false`, a `NamedPipeClientStream` is created — call `Connect()` or `TryConnect()` to establish the link.
+</ParamField>
+
+<ParamField path="pTokenCancellation" type="CancellationToken" default="default">
+  Controls the lifetime of the internal send and receive background loops. Cancel this token to stop both loops cleanly.
+</ParamField>
+
+<ParamField path="pName" type="string" default='"TerbinPipe"'>
+  The named-pipe identifier visible to the operating system. Both sides of a connection must use the same name.
+</ParamField>
+
+The constructor automatically calls `TerbinExecutor.Init(this)`, which registers all internal protocol handlers (Load, Solicit, Response, Prolong) with the global `TerbinExecutableManager`.
+
+## Key Properties
+
+<CardGroup cols={2}>
+  <Card title="IsServer" icon="server">
+    `bool` — `true` when the instance was created in server mode. Read-only after construction.
+  </Card>
+  <Card title="IsConnect" icon="link">
+    `bool` — reflects the live `IsConnected` state of the underlying `PipeStream`. Returns `false` if the pipe is `null`.
+  </Card>
+  <Card title="MaximumResponseTime" icon="clock">
+    `ushort` — seconds before a `Communicate()` call times out. Defaults to `TerbinProtocol.MAXIMUS_RESPONSE_TIME` (8 seconds). Can be changed at any time.
+  </Card>
+</CardGroup>
+
+## Connecting
+
+### `Connect()`
+
+```csharp
+public async Task<bool> Connect()
+```
+
+Calls `ConnectAsync()` on the underlying `NamedPipeClientStream` and then starts the background send and receive loops. Returns `true` on success. **Only valid when `IsServer = false`.**
+
+### `TryConnect()`
+
+```csharp
+public async Task<bool> TryConnect()
+```
+
+Guards the call: does nothing and returns `false` if the pipe is already connected or if the instance is a server. Use this for safe reconnection attempts in client code.
+
+```csharp
+// Minimal client bootstrap
+var cts = new CancellationTokenSource();
+var client = new TerbinCommunicator(pIsServer: false, cts.Token, "TerbinPipe");
+bool connected = await client.TryConnect();
+```
+
+## Sending Data
+
+Terbin distinguishes between fire-and-forget sends and awaited request-response pairs.
+
+### `Send()`
+
+```csharp
+public async Task<PacketRequest?> Send(
+    IdArray pActionMethod,
+    byte[] pPayload,
+    CodeStatus pStatus = CodeStatus.Execute,
+    ushort? pId = null)
+```
+
+Enqueues the packet and returns immediately. If the payload is small enough (≤ `MAX_PLD`) this returns `null`. If fragmentation is required and the handshake or memory allocation fails, the returned `PacketRequest` contains the error status.
+
+### `SendBytes()`
+
+```csharp
+public async Task<PacketRequest?> SendBytes(
+    IdArray pActionMethod,
+    CodeStatus pStatus = CodeStatus.Execute,
+    ushort? pId = null,
+    params byte[] pPayload)
+```
+
+Convenience overload that accepts individual bytes as `params`. Useful for short control signals.
+
+### `Communicate()`
+
+```csharp
+public async Task<PacketRequest> Communicate(
+    IdArray pActionMethod,
+    byte[] pPayload,
+    CodeStatus pStatus = CodeStatus.Execute,
+    ushort? pId = null)
+```
+
+Sends a packet **and awaits the remote response**. Internally registers a `TaskCompletionSource` keyed by the packet ID. When the peer sends back a packet with the same `IdRequest`, the internal `Response` handler resolves the TCS and this method returns.
+
+<Warning>
+  If no response arrives within `MaximumResponseTime` seconds (default 8), the cancellation callback fires and `Communicate()` returns a timeout packet with `Head.Status == CodeStatus.OverMaximumTime`. Always check `result.Head.Status` before reading the payload.
+</Warning>
+
+## Receiving Data — `OnRecive` Event
+
+```csharp
+public event Func<PacketRequest, Task<InfoResponse?>>? OnRecive
+```
+
+Subscribe to this event to handle all incoming packets on the server (or client) side. The delegate receives a fully assembled `PacketRequest` — if the packet was fragmented, `TerbinMemoryHelper.TryGetMemoryStream` has already reassembled the payload before the event fires.
+
+Return an `InfoResponse?` from the handler. A non-null return value is automatically dispatched back to the sender via `Reply()`.
+
+```csharp
+communicator.OnRecive += async (PacketRequest request) =>
+{
+    // request.Head     — Header (IdRequest, OrderRequest, Status, IdMemory)
+    // request.ActionMethod — IdArray byte key identifying the handler
+    // request.Payload  — reassembled byte payload
+
+    // Route to the executable dispatcher:
+    return await TerbinExecutableManager.DispatchAsync(
+        request.Head,
+        request.Payload,
+        request.ActionMethod);
+};
+```
+
+## Accepting Additional Clients — `OnNewClientConnect` Event
+
+```csharp
+public event Func<Task>? OnNewClientConnect
+```
+
+Fires on the server after the first client connects. The pipe slot is now occupied, so to accept further connections the server must create a new `TerbinCommunicator` instance for the next client.
+
+<Tip>
+  Subscribe to `OnNewClientConnect` and spin up a fresh server communicator inside the handler so that multiple clients can connect concurrently. Each accepted client should get its own `TerbinCommunicator` instance.
+</Tip>
+
+```csharp
+communicator.OnNewClientConnect += async () =>
+{
+    // Create a new server pipe for the next client
+    _ = Task.Run(() => StartServerPipe(cancellationToken));
+};
+```
+
+## Replying and Advanced Control
+
+### `Reply(InfoResponse)`
+
+```csharp
+public async Task Reply(InfoResponse pInfo)
+```
+
+Packages and enqueues a response packet using the `IdRequest`, `Status`, `ActionMethod`, and `Payload` from the provided `InfoResponse`. Called automatically when `OnRecive` returns a non-null value, but also available for deferred reply scenarios.
+
+### `GiveResponse(PacketRequest)`
+
+```csharp
+public void GiveResponse(PacketRequest pCapsule)
+```
+
+Manually resolves a pending `Communicate()` awaiter by matching `pCapsule.Head.IdRequest` against the `_pendingRequests` dictionary. Use this in advanced scenarios where you want to deliver a response outside the normal `OnRecive` path.
+
+### `GiveProlong(ushort)`
+
+```csharp
+public void GiveProlong(ushort pIdRequest)
+```
+
+Resets the timeout timer for an in-flight `Communicate()` call identified by `pIdRequest`. This prevents a `CodeStatus.OverMaximumTime` result when a long-running operation needs more time. The timer is reset to another full `MaximumResponseTime` interval.
+
+## Static Pipe Factories
+
+```csharp
+public static NamedPipeServerStream CreateServerPipe(string pName = "TerbinPipe")
+public static NamedPipeClientStream CreateClientPipe(string pName = "TerbinPipe")
+```
+
+These helpers create pre-configured pipe instances:
+
+- **Server** — bidirectional (`PipeDirection.In | PipeDirection.Out`), `MaxAllowedServerInstances`, `Byte` transmission mode, async options.
+- **Client** — bidirectional (`PipeDirection.InOut`), async options, connecting to `"."` (local machine).
+
+Also available as static properties `TerbinCommunicator.NewTerbinPipe` and `TerbinCommunicator.NewClientTerbinPipe`.
+
+## Full Setup Examples
+
+### Minimal Server
+
+```csharp
+// In a BackgroundService or Worker
+private void StartServerPipe(CancellationToken stoppingToken)
+{
+    var server = new TerbinCommunicator(
+        pIsServer: true,
+        pTokenCancellation: stoppingToken,
+        pName: "TerbinPipe");
+
+    // Route all packets through the global dispatcher
+    server.OnRecive += async (PacketRequest req) =>
+        await TerbinExecutableManager.DispatchAsync(req.Head, req.Payload, req.ActionMethod);
+
+    // When a client connects, prepare the next slot
+    server.OnNewClientConnect += async () =>
+    {
+        _ = Task.Run(() => StartServerPipe(stoppingToken), stoppingToken);
+    };
+
+    // Server waits for the client automatically in the constructor
+}
+```
+
+### Minimal Client
+
+```csharp
+var cts = new CancellationTokenSource();
+var client = new TerbinCommunicator(
+    pIsServer: false,
+    pTokenCancellation: cts.Token,
+    pName: "TerbinPipe");
+
+bool ok = await client.TryConnect();
+if (!ok)
+{
+    Console.WriteLine("Connection failed.");
+    return;
+}
+
+// Fire-and-forget send
+await client.Send(
+    new IdArray((byte)CodeServices.Execute, (byte)CodeServicesSection.Instances),
+    payload);
+
+// Request-response round-trip
+PacketRequest response = await client.Communicate(
+    new IdArray((byte)CodeServices.Read, (byte)CodeServicesSection.Plugin),
+    Array.Empty<byte>());
+
+if (response.Head.Status == CodeStatus.Succes)
+{
+    // Process response.Payload
+}
+```
+
+## IDisposable Cleanup
+
+`TerbinCommunicator` implements `IDisposable`. Calling `Dispose()` releases the underlying `PipeStream`, the `StreamReadStruct`, and the `StreamWriteStruct`. Always dispose when shutting down to avoid handle leaks:
+
+```csharp
+using var server = new TerbinCommunicator(pIsServer: true, stoppingToken);
+// ...
+// Automatically disposed at end of using block
+```

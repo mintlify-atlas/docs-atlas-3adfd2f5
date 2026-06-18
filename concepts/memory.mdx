@@ -1,0 +1,210 @@
+---
+title: "Terbin In-Memory Fragment Assembly with TerbinMemory"
+sidebarTitle: "Memory"
+description: "How TerbinMemory stores, orders, and reassembles byte fragments for large payloads that exceed the single-packet size limit."
+---
+
+When a Terbin sender has a payload larger than `MAX_PLD` (65,520 bytes), it splits the data into chunks and streams each chunk as a separate packet with an incrementing `OrderRequest` index. The receiver must accumulate these fragments in the correct order and reassemble them into the original byte stream before dispatching the handler. The memory subsystem — `TerbinMemory`, `TerbinMemoryManager`, and `TerbinMemoryHelper` — is responsible for the entire receive-side fragment lifecycle.
+
+<Note>
+  The first 10 memory slot IDs (0–9, the `RESERVE_MEMORY` constant) are reserved for internal protocol operations. Application code should never manually allocate, store to, or release slots in this range. `TerbinMemoryHelper.TryReleaseMemory` enforces this guard by refusing to release any slot with `IdMemory <= RESERVE_MEMORY`.
+</Note>
+
+## `TerbinMemory` — A Single Fragment Store
+
+A `TerbinMemory` instance represents one reassembly slot. Internally it holds a `Dictionary<ushort, byte[]>` keyed by fragment order index.
+
+### Properties
+
+<ResponseField name="Id" type="byte">
+  The slot's unique byte identifier within `TerbinMemoryManager`. Assigned when the slot is created.
+</ResponseField>
+
+<ResponseField name="IdRequest" type="ushort">
+  The `IdRequest` of the fragmented transmission currently using this slot. Initialized to `CodeTerbinMemory.NotAsign` (1) when free.
+</ResponseField>
+
+<ResponseField name="IsOcupated" type="bool">
+  Computed from `IdRequest != (ushort)CodeTerbinMemory.NotAsign`. `true` while a fragmented send is in progress.
+</ResponseField>
+
+### `AddFragment(ushort order, byte[] data)`
+
+```csharp
+public void AddFragment(ushort pOrder, byte[] pData)
+```
+
+Stores a fragment under its `OrderRequest` key. Duplicate order values are silently ignored (the first arrival wins). Increments `_totalSize` by the fragment length. Fires `OnAdd` after insertion.
+
+### `TryGetFullData(out byte[] data)`
+
+```csharp
+public (bool succes, TerbinErrorCode typeError) TryGetFullData(out byte[] pData)
+```
+
+Attempts to assemble the complete payload from all stored fragments:
+
+1. Takes a thread-safe snapshot of `_fragments` under a lock.
+2. Returns `(false, TerbinErrorCode.InvalidLength)` if no fragments have arrived yet.
+3. Sorts fragments by `OrderRequest` key.
+4. Calls the private `chechMissing` validator — iterates the sorted array and confirms that the keys are exactly `1, 2, 3, ..., N` with no gaps.
+5. On success, concatenates all fragment byte arrays into a single buffer using `Buffer.BlockCopy` and returns `(true, TerbinErrorCode.None)`.
+
+<Warning>
+  If `TryGetFullData` returns `TerbinErrorCode.OrderMismatch`, at least one fragment arrived out of order or a fragment in the sequence is missing. The receiver returns `CodeStatus.ErrorGetPaylaodMemory` to the sender in this case, and the slot is released without delivering any data to the handler.
+</Warning>
+
+### `Release()`
+
+```csharp
+public void Release()
+```
+
+Marks the slot as free by resetting `IdRequest` to `CodeTerbinMemory.NotAsign`, nulls `OnAdd`, fires `OnRelease`, then calls `Clear()`. After `Release()` the slot can be reused for a new fragmented transfer.
+
+### `Clear()`
+
+```csharp
+public void Clear()
+```
+
+Discards all fragment entries and resets `_totalSize` to zero. Thread-safe via `lock (_fragments)`. Called by `Release()` and also usable independently to abandon a partial transfer.
+
+### Events
+
+| Event | When it fires |
+|---|---|
+| `OnAdd` | After each successful `AddFragment` call |
+| `OnRelease` | During `Release()`, before `Clear()` |
+
+## `TerbinMemoryManager` — The Slot Pool
+
+`TerbinMemoryManager` is a static class that manages the global pool of `TerbinMemory` slots using a `ConcurrentDictionary<byte, TerbinMemory>`.
+
+### Requesting a New Slot — `GetFreeStore()`
+
+```csharp
+public static byte GetFreeStore()
+```
+
+Scans `_containers` for any slot where `IsOcupated == false`. If one exists, returns its ID immediately. If all existing slots are occupied, creates a new `TerbinMemory` instance with a fresh `MiniID.NewB` byte identifier, adds it to the dictionary, and returns the new ID.
+
+This is called by `TerbinExecutor.Solicit` when the remote side sends `CodeStatus.Execute` with `IdMemory = CodeTerbinMemory.New`.
+
+### Storing Fragments — `Store()` and `OverwriteStore()`
+
+```csharp
+public static void Store(byte pIdMemory, ushort pOrder, byte[] pData)
+public static void OverwriteStore(byte pIdMemory, ushort pOrder, byte[] pData)
+```
+
+`Store` uses `GetOrAdd` to locate (or create) the slot and calls `AddFragment`. `OverwriteStore` clears any existing content in the slot before adding the fragment — used internally by `TerbinExecutor.Load` when `OrderRequest == 0`.
+
+### Retrieving — `TryGetResult()`
+
+```csharp
+public static (bool succes, TerbinErrorCode typeError) TryGetResult(
+    byte pIdMemory,
+    out byte[] pData)
+```
+
+Looks up the slot and delegates to `TerbinMemory.TryGetFullData`. Returns the same `(succes, typeError)` tuple.
+
+### Releasing — `Release()`
+
+```csharp
+public static bool Release(byte pIdMemory)
+```
+
+Looks up the slot and calls `TerbinMemory.Release()`. Returns `true` if the slot existed. Does **not** remove the slot from the dictionary; it remains available for reuse.
+
+### Removing — `Remove()`
+
+```csharp
+public static bool Remove(byte pIdMemory)
+```
+
+Permanently removes the slot entry from the dictionary. Returns `true` if the entry existed.
+
+## `TerbinMemoryHelper` — Integration with the Receive Path
+
+`TerbinMemoryHelper` is the bridge between `TerbinCommunicator.handleReceive` and the memory subsystem.
+
+### `TryGetMemoryStream(PacketRequest, out byte[])`
+
+```csharp
+public static TerbinErrorCode TryGetMemoryStream(
+    PacketRequest pCapsule,
+    out byte[] pMemory)
+```
+
+The primary entry point called for every received packet:
+
+- If `pCapsule.Head.OrderRequest != FINAL_PACKET` — the packet is either a single-packet transmission or an intermediate fragment. The payload is returned directly and `TerbinErrorCode.None` is returned.
+- If `OrderRequest == FINAL_PACKET` — calls `TryAssembleStream` to merge all stored fragments with the final packet's payload, then calls `TryReleaseMemory` to free the slot. If reassembly succeeds but release fails, the error code is upgraded to `TerbinErrorCode.MemoryReleaseFailed`.
+
+### `TryAssembleStream(PacketRequest, out byte[])`
+
+```csharp
+public static TerbinErrorCode TryAssembleStream(
+    PacketRequest pCapsule,
+    out byte[] pMemory)
+```
+
+Calls `TerbinMemoryManager.TryGetResult` for the slot ID from the header, then calls `CombinePayload` to concatenate the stored fragments with the final packet's payload (`[stored bytes] + [final payload]`).
+
+### `TryReleaseMemory(byte)`
+
+```csharp
+public static bool TryReleaseMemory(byte pIdMemory)
+```
+
+Guards the release: only calls `TerbinMemoryManager.Release` when `pIdMemory > TerbinProtocol.RESERVE_MEMORY`. Protects protocol-reserved slot IDs from accidental release.
+
+### `CombinePayload(PacketRequest, byte[])`
+
+```csharp
+public static byte[] CombinePayload(PacketRequest pCapsule, byte[] pBytes)
+```
+
+Concatenates `pBytes` (all previously stored fragments) and `pCapsule.Payload` (the final chunk) into a single contiguous array using `Buffer.BlockCopy`. The result is the complete reassembled payload delivered to the handler.
+
+## Memory Lifecycle Sequence
+
+```
+Sender                              Receiver
+──────                              ────────
+Send CheckExecution ──────────────► DispatchAsync returns Succes
+Send Solicit ─────────────────────► TerbinExecutor.Solicit
+                                     └─ GetFreeStore() → id=15
+                   ◄── Reply(id=15) ─┘
+Send Load(order=1, id=15, chunk1) ──► TerbinExecutor.Load
+                                      └─ Store(15, 1, chunk1)
+Send Load(order=2, id=15, chunk2) ──► TerbinExecutor.Load
+                                      └─ Store(15, 2, chunk2)
+Send Final(order=65535, id=15, tail) ► handleReceive
+                                      └─ TryGetMemoryStream
+                                          └─ OrderRequest==FINAL_PACKET
+                                          └─ TryAssembleStream(id=15)
+                                              └─ TryGetResult → [c1+c2]
+                                              └─ CombinePayload → [c1+c2+tail]
+                                          └─ TryReleaseMemory(15)
+                                          └─ OnRecive([full payload])
+```
+
+## Practical Notes
+
+<CardGroup cols={2}>
+  <Card title="Thread Safety" icon="lock">
+    Fragment insertion in `AddFragment` is protected by `lock (_fragments)`. The `ConcurrentDictionary` in `TerbinMemoryManager` makes slot-level operations safe across multiple concurrent transfers.
+  </Card>
+  <Card title="Slot Reuse" icon="arrows-rotate">
+    Slots are never permanently removed by the normal fragment flow — `Release()` resets state but leaves the slot in the pool. This avoids repeated dictionary allocation for frequently used large-payload routes.
+  </Card>
+  <Card title="No Manual Management" icon="ban">
+    Application handlers receive the fully assembled payload. They never need to call `TerbinMemoryManager` or `TerbinMemoryHelper` directly.
+  </Card>
+  <Card title="Ordered Validation" icon="list-ol">
+    `chechMissing` requires keys `1, 2, 3, ..., N` in exact consecutive order. A sender that accidentally sends two fragments with the same order index or skips an index will cause `TerbinErrorCode.OrderMismatch`.
+  </Card>
+</CardGroup>

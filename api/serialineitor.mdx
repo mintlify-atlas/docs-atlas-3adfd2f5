@@ -1,0 +1,187 @@
+---
+title: "Serialineitor: Fluent Binary Serialization Builder"
+sidebarTitle: "Serialineitor"
+description: "API reference for Serialineitor — the fluent builder for constructing binary payloads, plus static utility methods for serializing unmanaged types and arrays."
+---
+
+`Serialineitor` is the primary tool for building binary payloads in Terbin. It provides both a fluent instance API (accumulate values into a growing buffer, then call `Serialize()`) and a collection of static utility methods for one-shot serialization of individual values, arrays, and `IStructSerializable` structs.
+
+## IStructSerializable Interface
+
+Any struct that participates in Terbin's binary protocol must implement `IStructSerializable`:
+
+```csharp
+public interface IStructSerializable
+{
+    int GetSize();                          // byte size of the serialized form
+    void WriteTo(Span<byte> pBuffer);       // write fields into buffer
+    void ReadFrom(ReadOnlySpan<byte> pBuffer); // populate fields from buffer
+
+    // Default interface methods:
+    byte[] Serialize();                     // calls WriteTo on a new buffer
+    void Deserialize(byte[] pArray);        // calls ReadFrom
+}
+```
+
+The `ExtensionIStructSerializable` class also provides extension variants `Serialize()`, `Deserialize(byte[])`, and `Read(byte[])` for any `IStructSerializable` instance.
+
+---
+
+## Serialineitor Instance API (Fluent Builder)
+
+The instance API accumulates values into an auto-growing internal buffer. Ideal for building multi-field request or response payloads.
+
+**Constructor overloads:**
+
+```csharp
+new Serialineitor()                         // starts with 2 bytes
+new Serialineitor(int pSize)                // starts with pSize bytes
+new Serialineitor(byte[]? pInitialContent, int pSize = 2) // start from existing bytes
+```
+
+### Instance Methods
+
+<ParamField path="Add<T>(T pValue)" type="Serialineitor">
+  Appends an unmanaged value to the buffer. The buffer auto-grows if needed. Returns `this` for chaining.
+</ParamField>
+
+<ParamField path="AddArray<T>(T[] pArray)" type="Serialineitor">
+  Appends a `ThreeQuartersInt` (3-byte) length prefix followed by the raw element bytes. Returns `this` for chaining.
+</ParamField>
+
+<ParamField path="AddStruct<T>(T pStruct)" type="Serialineitor">
+  Appends an `IStructSerializable` struct by calling `pStruct.WriteTo()`. Returns `this` for chaining.
+</ParamField>
+
+<ParamField path="Serialize()" type="byte[]">
+  Returns the accumulated bytes trimmed to the current offset. Does not reset the builder.
+</ParamField>
+
+<ParamField path="ToArray()" type="byte[]">
+  Alias for `Serialize()`.
+</ParamField>
+
+<ParamField path="Clear()" type="void">
+  Zeros the internal buffer and resets the offset to 0, allowing reuse.
+</ParamField>
+
+**Example — building a GetAll response:**
+
+```csharp
+var manis = new ManifestPluginDTO[] { dto1, dto2 };
+
+Serialineitor s = new();
+s.Add<ThreeQuartersInt>(manis.Length);          // 3-byte count header
+for (int i = 0; i < manis.Length; i++)
+    s.AddStruct<ManifestPluginDTO>(manis[i]);    // variable-length structs
+
+return InfoResponse.CreateSucces(pHead.IdRequest, s.Serialize());
+```
+
+---
+
+## Serialineitor Static Methods
+
+### Single-value serialization
+
+```csharp
+// Serialize a single unmanaged value to byte[]
+byte[] Serialineitor.Serialize<T>(T pValue) where T : unmanaged
+
+// Deserialize a single unmanaged value from byte[]
+T Serialineitor.Deserialize<T>(byte[] pBuffer) where T : unmanaged
+T Serialineitor.Deserialize<T>(byte[] pBuffer, int pOffset) where T : unmanaged
+```
+
+### Struct serialization (IStructSerializable)
+
+```csharp
+// Serialize using IStructSerializable.WriteTo — no Marshal overhead
+byte[] Serialineitor.SerializeStructRaw<T>(T pStruct)
+    where T : struct, IStructSerializable
+
+// Deserialize using IStructSerializable.ReadFrom
+T Serialineitor.DeserializeStructRaw<T>(byte[] pBuffer)
+    where T : struct, IStructSerializable
+
+// Marshal-based fallback (inefficient — prefer Raw)
+byte[] Serialineitor.SerializeStructConst<T>(T pStruct) where T : struct
+T     Serialineitor.DeserializeStructConst<T>(byte[] pBytes) where T : struct
+```
+
+### Array serialization
+
+```csharp
+// Raw — no length prefix; just the element bytes
+byte[] Serialineitor.SerializeArrayRaw<T>(T[] pArray) where T : unmanaged
+
+// Raw — deserialize from a span, optionally limiting length
+T[] Serialineitor.DeserializeArrayRaw<T>(ReadOnlySpan<byte> pArray, int? pLenght = null)
+    where T : unmanaged
+
+// [Obsolete] — use Raw or Buffer variants instead
+byte[] Serialineitor.SerializeArray<T>(T[] pArray) where T : unmanaged
+T[]   Serialineitor.DeserializeArray<T>(byte[] pArray) where T : unmanaged
+T[]   Serialineitor.DeserializeArray<T>(ref byte[] pArray) where T : unmanaged
+```
+
+<Warning>
+`SerializeArray`, `DeserializeArray` (both overloads), and the Marshal-based struct methods are marked `[Obsolete]`. Prefer `SerializeArrayRaw`, `DeserializeArrayRaw`, `SerializeStructRaw`, and `DeserializeStructRaw` for new code.
+</Warning>
+
+### Array length helpers
+
+```csharp
+// Returns the ThreeQuartersInt byte-count for pLength elements of type T
+ThreeQuartersInt Serialineitor.GetArraySize<T>(int pLength) where T : unmanaged
+ThreeQuartersInt Serialineitor.GetArraySize<T>(ThreeQuartersInt pLength) where T : unmanaged
+```
+
+### Byte array concatenation
+
+```csharp
+// Concatenate two byte arrays
+byte[] Serialineitor.Splice(byte[] pFirst, byte[] pSecond)
+
+// Concatenate N byte arrays
+byte[] Serialineitor.Splice(params byte[][] pArrays)
+```
+
+### Enum-to-byte conversion
+
+```csharp
+// Convert object[] (enums, bytes, convertibles) to byte[]
+// Used internally by TerbinExecutableAttribute(params object[])
+byte[] Serialineitor.CastToByte(params object[] pData)
+```
+
+---
+
+## ThreeQuartersInt
+
+`ThreeQuartersInt` is a 3-byte (24-bit) integer type that Terbin uses for array length headers — saving 1 byte compared to a standard `int` per field.
+
+| Constant | Value |
+|---|---|
+| `Size` | `3` (bytes) |
+| `MaxValue` | `0xFF_FF_FF` = 16,777,215 |
+| `MinValue` | `0x0` |
+
+Implicit conversions to and from `int`, `uint`, and `Index` are provided, so it integrates transparently with standard C# arithmetic and array slicing.
+
+```csharp
+ThreeQuartersInt count = 42;        // implicit from int
+int n = count;                       // implicit to int
+```
+
+---
+
+## BufferErrorCode
+
+The `BufferErrorCode` enum (`sbyte`) is returned by `BufferWriterExtension` methods:
+
+| Value | Meaning |
+|---|---|
+| `Succes (1)` | Write succeeded |
+| `SurpassesMax (2)` | Array length exceeds `ThreeQuartersInt.MaxValue` |
+| `BufferSmall (3)` | Not enough space remaining in the destination buffer |

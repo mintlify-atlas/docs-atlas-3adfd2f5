@@ -1,0 +1,173 @@
+---
+title: "Configuration Service: Read and Update Service Routes"
+sidebarTitle: "Configuration"
+description: "ServiceConfiguration exposes operations to read and update the key-value route configuration used by TerbinService for Farlands, Steam, Proton, and instance paths."
+---
+
+`ServiceConfiguration` is a static handler class that provides IPC access to Terbin's persistent key-value configuration store. The store is backed by a `Dictionary<string, string>` serialized to `config/config.json` and managed by `Manager.Configuration`. Every other service in TerbinService reads configuration paths through this manager at runtime, so routes updated here take effect immediately on the next call.
+
+<Note>
+  **UpdateRute** (`CodeServices.Create`) is present in the source but its `[TerbinExecutable]` attribute is commented out in the current codebase. The attribute line reads `//[TerbinExecutable((byte)CodeServices.Create, (byte)CodeServicesSection.Rute)]`. Only **ReadRute** is actively registered and callable over IPC.
+</Note>
+
+## Configuration Keys
+
+The following keys are defined as constants in `TerbinConfiguration` and are recognized by `Manager.Configuration`:
+
+| Key constant | String value | Description | Auto-detected? |
+|---|---|---|---|
+| `TerbinConfiguration.RUTE_FARLANDS` | `rute_farlands` | Absolute path to the Farlands game installation directory. | Yes — via `ManagerFarlands.GetRuteSteamFarlands()` |
+| `TerbinConfiguration.RUTE_INSTANCES` | `rute_instances` | Directory where Terbin stores all game instance subdirectories. | Yes — defaults to `~/Documents/TerbinInstances` |
+| `TerbinConfiguration.RUTE_STORAGE_PLUGINS` | `rute_plugins` | Directory where downloaded plugin archives are stored. | Yes — defaults to `~/Documents/TerbinStorage` |
+| `TerbinConfiguration.RUTE_STEAM` | `rute_steam` | Absolute path to the Steam installation. | No — must be set manually |
+| `TerbinConfiguration.RUTE_PROTON` | `rute_proton` | Absolute path to the Proton installation used to run the game on Linux. | No — must be set manually |
+| `TerbinConfiguration.RUTE_PROTON_TMP` | `rute_proton_tmp` | Temporary directory used by Proton at runtime. | No — must be set manually |
+
+<Info>
+  On first startup, `Manager.Configuration` calls `setPredeterminatedConfig()` which auto-detects and persists `rute_farlands`, `rute_instances`, and `rute_plugins`. The Steam and Proton keys have no automatic defaults and will return `AccesNullOrNotExist` until configured. The source also notes a TODO to manage Steam/Proton installation state and to move instances when their path changes.
+</Info>
+
+---
+
+## Operations
+
+<Accordion title="ReadRute — (CodeServices.Read, CodeServicesSection.Rute)">
+
+Reads the configured path value for a given configuration key. Internally calls `Manager.Configuration.GetConfg(keyRute)`. If the key is not in the stored dictionary, the manager attempts `getPredeterminatedAndSave` to fill in a default for the three auto-detected keys.
+
+**Action bytes:** `(byte)CodeServices.Read`, `(byte)CodeServicesSection.Rute` = `50`
+
+### Request Payload
+
+<ParamField body="keyRute" type="char[]" required>
+  The configuration key to read, encoded as a length-prefixed UTF-16 char array using `Serialineitor.SerializeArray<char>`. Use one of the string constants from the table above (e.g., `"rute_farlands"`).
+</ParamField>
+
+### Response Payload
+
+The response `Status` field indicates the result:
+
+| `CodeStatus` | Meaning |
+|---|---|
+| `Succes` | Key found. The payload is a length-prefixed UTF-16 char array of the configured path. |
+| `AccesNullOrNotExist` | The key is not configured and has no default. Payload is empty. |
+| `ErrorNotPayload` | The request payload was empty or the deserialized key string was empty. |
+
+<ResponseField name="value" type="char[]">
+  Present only when `Status == Succes`. The configured path value as a length-prefixed UTF-16 char array. Reconstruct the string with `new string(Serialineitor.DeserializeArray<char>(ref bytes))`.
+</ResponseField>
+
+### Example
+
+```csharp
+// Read rute_farlands
+byte[] keyBytes = Serialineitor.SerializeArray<char>("rute_farlands".ToCharArray());
+
+var response = await client.Communicate(
+    (byte)CodeServices.Read,
+    (byte)CodeServicesSection.Rute,
+    keyBytes
+);
+
+if (response.Status == CodeStatus.Succes)
+{
+    byte[] pld = response.Payload;
+    string path = new string(Serialineitor.DeserializeArray<char>(ref pld));
+    Console.WriteLine($"Farlands path: {path}");
+}
+else if (response.Status == CodeStatus.AccesNullOrNotExist)
+{
+    Console.WriteLine("Key is not configured.");
+}
+```
+
+</Accordion>
+
+<Accordion title="UpdateRute — (CodeServices.Create, CodeServicesSection.Rute)">
+
+Updates or inserts a configuration key-value pair. Internally calls `Manager.Configuration.SetConfig(keyRute, newRute)`, which reads the current dictionary, sets `data[keyRute] = newRute`, and saves it back with `JSonUtil.Save`. After saving, `OnChangeConfig` is fired on a background task (100 ms delay) so other internal components can react to the change.
+
+<Warning>
+  The `[TerbinExecutable]` attribute for this operation is currently **commented out** in `ServiceConfiguration.cs`. This means the endpoint is not registered in the IPC router and cannot be called over IPC in the current build. The method body is fully implemented and the attribute line can be uncommented to enable it.
+</Warning>
+
+**Action bytes (when enabled):** `(byte)CodeServices.Create`, `(byte)CodeServicesSection.Rute` = `50`
+
+### Request Payload
+
+<ParamField body="keyRute" type="char[]" required>
+  The configuration key to write, encoded as a length-prefixed UTF-16 char array.
+</ParamField>
+
+<ParamField body="newRute" type="char[]" required>
+  The new path value, encoded as a length-prefixed UTF-16 char array.
+</ParamField>
+
+### Response
+
+The response carries only a `CodeStatus` field (no payload body):
+
+| `CodeStatus` | Meaning |
+|---|---|
+| `Succes` | Key updated and persisted successfully (`CodeAcessJSonSave.Succes`). |
+| `SerializeError` | The config dictionary could not be serialized to JSON (`CodeAcessJSonSave.ErrorSerialize`). |
+| `AccesNullOrNotExist` | Any other failure result from `SetConfig`. |
+| `ErrorNotPayload` | The request payload was empty or `newRute` deserialized to `null`. |
+
+### Example
+
+```csharp
+Serialineitor s = new();
+s.AddArray<char>("rute_steam".ToCharArray());
+s.AddArray<char>("/home/user/.steam/steam".ToCharArray());
+
+var response = await client.Communicate(
+    (byte)CodeServices.Create,
+    (byte)CodeServicesSection.Rute,
+    s.Serialize()
+);
+
+if (response.Status == CodeStatus.Succes)
+    Console.WriteLine("Steam path updated.");
+```
+
+</Accordion>
+
+---
+
+## Reading All Known Keys
+
+Because there is no `ReadAll` operation for configuration, clients that need to display the full configuration state must issue one `ReadRute` request per key. The complete set of known keys is:
+
+<Steps>
+  <Step title="Read rute_farlands">
+    ```csharp
+    await ReadRute("rute_farlands");
+    ```
+  </Step>
+  <Step title="Read rute_instances">
+    ```csharp
+    await ReadRute("rute_instances");
+    ```
+  </Step>
+  <Step title="Read rute_plugins">
+    ```csharp
+    await ReadRute("rute_plugins");
+    ```
+  </Step>
+  <Step title="Read rute_steam">
+    ```csharp
+    await ReadRute("rute_steam");
+    ```
+  </Step>
+  <Step title="Read rute_proton">
+    ```csharp
+    await ReadRute("rute_proton");
+    ```
+  </Step>
+  <Step title="Read rute_proton_tmp">
+    ```csharp
+    await ReadRute("rute_proton_tmp");
+    ```
+  </Step>
+</Steps>

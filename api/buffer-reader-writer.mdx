@@ -1,0 +1,166 @@
+---
+title: "BufferReader and BufferWriter: Low-Level Span API"
+sidebarTitle: "Buffer Reader/Writer"
+description: "API reference for BufferReader and BufferWriter — the low-level Span-based APIs for reading and writing unmanaged types, arrays, and IStructSerializable structs into byte buffers."
+---
+
+`BufferWriter` and `BufferReader` are the low-level building blocks that `Serialineitor` delegates to internally. Use them directly when you need precise control over a pre-allocated `Span<byte>` or `ReadOnlySpan<byte>` without the auto-growing overhead of the builder.
+
+---
+
+## BufferWriter (Static)
+
+`BufferWriter` writes into an existing `Span<byte>` and advances a ref-passed offset integer.
+
+### Methods
+
+<ParamField path="Add<T>(Span<byte> pBuffer, ref int pOffset, T pValue)" type="void">
+  Writes a single unmanaged value at `pOffset` and advances `pOffset` by `sizeof(T)`.
+</ParamField>
+
+<ParamField path="AddArray<T>(Span<byte> pBuffer, ref int pOffset, T[] pArray)" type="void">
+  Writes a `ThreeQuartersInt` (3-byte) length header followed by the raw element bytes. Throws `ArgumentOutOfRangeException` if the buffer is too small.
+</ParamField>
+
+<ParamField path="AddStruct<T>(Span<byte> pBuffer, ref int pOffset, T pStruct)" type="void">
+  Writes an `IStructSerializable` struct by calling `pStruct.WriteTo()`.
+</ParamField>
+
+<ParamField path="EnsureAdd<T>(ref byte[] buffer, int offset, T value)" type="void">
+  Writes an unmanaged value into a `byte[]`, auto-resizing the array (doubling + `sizeof(T)`) if needed. Use when you do not know the required capacity upfront.
+</ParamField>
+
+**Example — offset-based write:**
+
+```csharp
+byte[] buf = new byte[64];
+int offset = 0;
+
+BufferWriter.Add<int>(buf, ref offset, 42);
+BufferWriter.AddArray<char>(buf, ref offset, "hello".ToCharArray());
+// offset now points past the written data
+```
+
+---
+
+## BufferWriterExtension
+
+Extension methods on `Span<byte>` in two flavors: **slicing** (the span advances automatically, returning a `BufferErrorCode`) and **offset-based** (the span is unchanged, you track position via `ref int`).
+
+### Slicing variants (advance the span)
+
+These return `BufferErrorCode` and slice the span forward after each write:
+
+```csharp
+BufferErrorCode Write<T>(this ref Span<byte> pBuffer, T pValue)
+    where T : unmanaged
+
+BufferErrorCode WriteArray<T>(this ref Span<byte> pBuffer, T[] pArray)
+    where T : unmanaged
+
+BufferErrorCode WriteStruct<T>(this ref Span<byte> pBuffer, T pStruct)
+    where T : struct, IStructSerializable
+```
+
+**Example — chained slicing writes:**
+
+```csharp
+Span<byte> buf = stackalloc byte[128];
+
+buf.Write((byte)CodeServices.Read);
+buf.Write((byte)CodeServicesSection.Plugin);
+buf.WriteArray("my-plugin-id".ToCharArray());
+```
+
+### Offset-based variants (span stays intact)
+
+These delegate to `BufferWriter` static methods and do not slice the span:
+
+```csharp
+void WriteArray<T>(this Span<byte> pBuffer, ref int pOffset, T[] pArray)
+void Write<T>(this Span<byte> pBuffer, ref int pOffset, T pValue)
+void WriteStruct<T>(this Span<byte> pBuffer, ref int pOffset, T pStruct)
+```
+
+<Tip>
+Prefer the slicing `ref Span<byte>` variants in hot paths to avoid managing a separate offset variable. Use the `ref int` variants when you need to keep the original span reference for later inspection.
+</Tip>
+
+---
+
+## BufferReader (Static)
+
+`BufferReader` reads from a `ReadOnlySpan<byte>` or `byte[]` and advances a ref offset.
+
+### Methods
+
+<ParamField path="Get<T>(ReadOnlySpan<byte> pBuffer, ref int pOffset)" type="T">
+  Reads a single unmanaged value at `pOffset` and advances `pOffset` by `sizeof(T)`.
+</ParamField>
+
+<ParamField path="GetArray<T>(ReadOnlySpan<byte> pBuffer, ref int pOffset)" type="T[]">
+  Reads a `ThreeQuartersInt` length header, then reads that many bytes and casts them to `T[]`. Advances `pOffset` past both the header and the data.
+</ParamField>
+
+<ParamField path="GetStruct<T>(ReadOnlySpan<byte> pBuffer, ref int pOffset, T pStruct)" type="T">
+  Deserializes a struct by calling `Serialineitor.DeserializeStructRaw` on a slice starting at `pOffset`, then advances `pOffset` by `pStruct.GetSize()`.
+</ParamField>
+
+---
+
+## BufferReaderExtension
+
+Extension methods on `ReadOnlySpan<byte>` mirroring the writer's two flavors.
+
+### Slicing variants (advance the span)
+
+```csharp
+T   Read<T>(this ref ReadOnlySpan<byte> pBuffer) where T : unmanaged
+T[] ReadArray<T>(this ref ReadOnlySpan<byte> pBuffer) where T : unmanaged
+T   ReadStruct<T>(this ref ReadOnlySpan<byte> pBuffer) where T : struct, IStructSerializable
+```
+
+### Offset-based variants (span stays intact)
+
+```csharp
+T   Read<T>(this ReadOnlySpan<byte> pBuffer, ref int pOffset) where T : unmanaged
+T[] ReadArray<T>(this ReadOnlySpan<byte> pBuffer, ref int pOffset) where T : unmanaged
+T   ReadStruct<T>(this ReadOnlySpan<byte> pBuffer, ref int pOffset) where T : struct, IStructSerializable
+T   ReadStruct<T>(this ReadOnlySpan<byte> pBuffer, ref int pOffset, T pStruct) where T : struct, IStructSerializable
+```
+
+**Example — deserializing a service response:**
+
+```csharp
+ReadOnlySpan<byte> reader = responsePayload;
+
+ThreeQuartersInt count = reader.Read<ThreeQuartersInt>();
+var items = new ManifestPluginDTO[count];
+for (int i = 0; i < count; i++)
+    items[i] = reader.ReadStruct<ManifestPluginDTO>();
+```
+
+---
+
+## Comparison: Slicing vs Offset-Based
+
+<CodeGroup>
+```csharp Slicing (ref Span)
+ReadOnlySpan<byte> reader = payload;
+string name = new string(reader.ReadArray<char>());
+string id   = new string(reader.ReadArray<char>());
+bool useProgress = reader.Read<bool>();
+```
+
+```csharp Offset-based (ref int)
+int offset = 0;
+ReadOnlySpan<byte> reader = payload;
+string name = new string(BufferReader.GetArray<char>(reader, ref offset));
+string id   = new string(BufferReader.GetArray<char>(reader, ref offset));
+bool useProgress = BufferReader.Get<bool>(reader, ref offset);
+```
+</CodeGroup>
+
+<Note>
+The slicing variants are used extensively in Terbin service handlers. See the `ReadOnlySpan<byte> reader = pParameters` pattern throughout `ServicePlugins.cs`, `ServiceInstances.cs`, etc.
+</Note>

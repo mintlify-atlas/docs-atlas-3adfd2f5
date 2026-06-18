@@ -1,0 +1,55 @@
+---
+title: "Terbin: Named-Pipe Mod Management Framework for Farlands"
+sidebarTitle: "Introduction"
+description: "Terbin is a C# framework for building mod management background services using named-pipe IPC, a binary packet protocol, and a reflection-based executable dispatcher."
+---
+
+Terbin is a C# framework designed to power background services for the Farlands modding ecosystem. It solves the problem of safely routing mod-management commands — installing plugins, managing instances, querying game paths — between a long-running Windows service and any number of client tools, without requiring the service to poll or ask its clients for information it already holds. Communication happens over OS-level named pipes using a compact binary packet protocol, and every command handler is discovered and wired up automatically at startup through a reflection-based dispatcher. The result is a system where adding a new command is as simple as decorating a static method with `[TerbinExecutable]`.
+
+## Projects at a Glance
+
+Terbin is organized into three C# projects that sit inside the `TerbinProyect.sln` solution:
+
+- **TerbinLibrary** — The core SDK. It contains the communication layer (`TerbinCommunicator`), the binary packet types (`Header`, `PacketRequest`, `IdArray`, `InfoResponse`), the protocol constants (`TerbinProtocol`), the fragmentation/memory subsystem (`TerbinMemoryManager`), and the entire execution-dispatch pipeline (`TerbinExecutableAttribute`, `TerbinExecutableManager`, `TerbinExecutor`). Almost everything you import in your own project comes from here.
+
+- **TerbinService** — The background service host. It runs as a .NET Generic Host (`Worker : BackgroundService`) and immediately begins listening on a named pipe called `TerbinPipe`. It contains a set of **Managers** that own business logic and mutable state (plugins, instances, games, configuration, the manifest index, the plugin storage), a set of thin **Services** that act as IPC dispatch handlers delegating to those managers, and **Valve helpers** (`ManagerSteam`, `ManagerProton`, `ManagerFarlands`) for Steam/Proton integration and Farlands game launching.
+
+- **SimulateClient** — A development and test client. It connects to the running service over the same pipe, registers its own executable handlers, and exposes an interactive command loop that lets you invoke any registered service method by name. It is the primary tool for testing new commands during development.
+
+## Design Philosophy
+
+Terbin is built around three ideas:
+
+1. **Managers are self-sufficient.** A manager is initialized with everything it needs; it never has to ask a client for information. This keeps the service authoritative and makes it safe to call manager methods from any thread without worrying about round-trip latency.
+2. **Services are thin.** A Service class contains only enough code to deserialize the incoming `byte[]` payload, call the right manager method, and serialize the result back into an `InfoResponse`. Business logic lives exclusively in managers.
+3. **Named pipes are the IPC layer.** `TerbinCommunicator` wraps `NamedPipeServerStream` / `NamedPipeClientStream` and handles connection, packet queuing, background send/receive loops, fragmentation of large payloads, and timeout-based pending-request tracking — all transparently.
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Build and run your first Terbin server and client in five minutes.
+  </Card>
+  <Card title="Architecture" icon="sitemap" href="/architecture">
+    Deep-dive into projects, layers, and how a packet flows end-to-end.
+  </Card>
+  <Card title="Communication" icon="plug" href="/concepts/communication">
+    Named pipes, `TerbinCommunicator`, packet queuing, and fragmentation.
+  </Card>
+  <Card title="Execution" icon="bolt" href="/concepts/execution">
+    `[TerbinExecutable]`, `TerbinExecutableManager`, and the dispatch pipeline.
+  </Card>
+</CardGroup>
+
+<Note>
+  Terbin was built specifically for the **Farlands modding ecosystem** and makes assumptions about paths, plugin layouts, and the BepInEx injector format. However, the IPC layer (`TerbinCommunicator`), the binary protocol (`TerbinProtocol`), and the reflection-based dispatcher (`TerbinExecutableManager`) are general-purpose and reusable in any C# project that needs a named-pipe command bus.
+</Note>
+
+## Key Features
+
+- **Named-pipe IPC** — Bidirectional, asynchronous communication over `NamedPipeServerStream` / `NamedPipeClientStream` with a single, consistent pipe name (`TerbinPipe` by default).
+- **Binary packet protocol** — Every message is a `PacketRequest` composed of a fixed-size `Header` (request ID, sequence order, status code, memory slot ID), a variable-length `IdArray` action key, and a raw `byte[]` payload.
+- **Automatic fragmentation** — Payloads larger than `MAX_PLD` (65,520 bytes / `0xFFF0`) are automatically split into fragments, uploaded via `TerbinMemory` slots on the receiver, and reassembled before the handler is invoked. The caller never manages this manually.
+- **Reflection-based dispatcher** — Decorate any `static async Task<InfoResponse?> Foo(Header, byte[], CancellationToken)` method with `[TerbinExecutable(byte action)]` and call `TerbinExecutor.Register(assembly)`. The dispatcher scans, validates method signatures, and registers handlers with no boilerplate switch statements.
+- **Request/response correlation** — `Communicate()` returns a `Task<PacketRequest>` that resolves when the matching response packet arrives, identified by a `ushort` request ID. Timeouts are enforced via `MaximumResponseTime` (default 8 seconds).
+- **Fire-and-forget sends** — `Send()` enqueues a packet without registering a pending reply, making it suitable for progress updates and notifications.
+- **Multi-client server** — The `OnNewClientConnect` event lets the server spin up a new `TerbinCommunicator` instance for each connecting client, enabling concurrent sessions.
+- **Farlands-aware managers** — Built-in managers for plugins, mod instances, game paths, BepInEx injection, Steam/Proton detection, and configuration backed by `config.json`.

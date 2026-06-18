@@ -1,0 +1,126 @@
+---
+title: "CodeStatus: HTTP-Inspired Packet Status Codes"
+sidebarTitle: "CodeStatus"
+description: "Reference for all CodeStatus enum values used in Terbin packet headers — covering informational, success, execution, client error, and server error ranges."
+---
+
+`CodeStatus` is a `short` enum that travels in every packet exchange as `Header.Status` and `InfoResponse.Status`. It communicates the outcome or intent of a packet — whether a request is being dispatched for the first time, succeeded, failed on the client side, or caused an internal worker fault. The design is intentionally HTTP-inspired: the hundreds digit signals the broad category, while the units provide the specific condition.
+
+## Special value
+
+| Value | Name | When Used |
+|-------|------|-----------|
+| `-1` | `NotAsign` | Default/uninitialized state. A packet whose status is still `NotAsign` has not been processed yet. |
+
+## 100s — Informational
+
+Informational statuses carry non-fatal diagnostic payloads back to the caller or to a monitoring channel.
+
+| Value | Name | When Used |
+|-------|------|-----------|
+| `100` | `Info` | Generic informational message; payload contains details. |
+| `101` | `Alert` | A notable condition worth surfacing to the caller (not an error). |
+| `102` | `Exception` | An exception occurred but was handled; payload carries exception details. |
+| `103` | `IsCancelled` | The operation was cancelled. Also see `InfoResponse.CreateCancelled`. |
+
+## 200s — Success
+
+| Value | Name | When Used |
+|-------|------|-----------|
+| `200` | `Succes` | The action completed successfully. Use `InfoResponse.CreateSucces` to build this response. |
+
+## 300s — Execution Control
+
+<Note>
+  **`Execute(300)` is the normal request status.** When a client sends a standard request it should set the status to `Execute`. The dispatcher treats this as the "normal path" and skips all status-check branches, routing directly to the registered handler.
+</Note>
+
+<Tip>
+  **Use `CheckExecution(303)` before sending large fragmented payloads.** Sending a `CheckExecution` probe first lets the server confirm that a handler for the target action exists. If the handler is missing the server returns `ActionNotFound(440)` immediately — saving you from uploading a multi-fragment payload only to have it rejected at the end.
+</Tip>
+
+| Value | Name | When Used |
+|-------|------|-----------|
+| `300` | `Execute` | Default status for a normal outgoing request. The dispatcher routes this directly to the handler. |
+| `301` | `ExecuteInternal` | Used for internally-triggered executions that originate inside the worker rather than from a client. |
+| `303` | `CheckExecution` | Preflight check: verify a handler exists for the target action before sending a large payload. |
+| `304` | `CancelByRequest` | The operation was cancelled because the client explicitly requested cancellation. |
+| `305` | `CancelByAction` | The operation was cancelled because the action handler itself decided to abort. |
+
+## 400s — Client Errors
+
+Client error statuses indicate that the problem is in the request itself — a missing resource, a malformed payload, an unknown action, or a permissions failure.
+
+<Warning>
+  **`SubActionNotFound(441)` is obsolete.** This value was a legacy distinction between "action" and "sub-action" routing. Use `ActionNotFound(440)` for all cases where the target action cannot be resolved.
+</Warning>
+
+| Value | Name | When Used |
+|-------|------|-----------|
+| `400` | `ClientError` | Generic client-side error not covered by a more specific code. |
+| `401` | `BadRequest` | The request was structurally invalid or missing required fields. |
+| `404` | `NotFound` | The requested resource could not be found. |
+| `440` | `ActionNotFound` | No handler is registered for the action key in the incoming packet. |
+| `441` | `SubActionNotFound` | **Obsolete** — use `ActionNotFound(440)` instead. |
+| `442` | `ActionNotInitiated` | The action exists but has not been fully initialised and cannot be invoked yet. |
+| `450` | `AccessDenied` | The caller does not have permission to invoke this action. |
+| `470` | `ErrorSoliciteMemory` | Failed to allocate or claim the memory slot requested by the packet. |
+| `471` | `AlreadyExistsPetition` | A petition with the same identifier is already in-flight; duplicates are not allowed. |
+
+## 500s — Server / Worker Errors
+
+Server error statuses indicate that the handler or the worker infrastructure itself caused the failure — the request was valid, but something went wrong on the server side.
+
+| Value | Name | When Used |
+|-------|------|-----------|
+| `500` | `InternalWorkerError` | Catch-all for unexpected worker failures. Also used by `InfoResponse.CreateInteralError`. |
+| `501` | `ExecutionException` | An unhandled exception was thrown inside the action handler. |
+| `502` | `ErrorNotPayload` | The packet arrived with no payload when one was required. |
+| `503` | `SerializeError` | Serialization or deserialization of the payload failed. |
+| `504` | `AccesNullOrNotExist` | A required object or reference was null or did not exist during handler execution. |
+| `550` | `OverMaximumTime` | The handler exceeded the maximum allowed response time (`MAXIMUS_RESPONSE_TIME = 8`). |
+| `551` | `OverMaximunPacket` | The number of packets exceeded the allowed maximum (`OverMaximunPacket`). |
+| `571` | `ErrorGetPaylaodMemory` | Failed to retrieve the payload from the memory store during reassembly. |
+| `572` | `ErrorReleaseMemory` | Failed to release the memory slot after processing. |
+
+## Quick reference — full enum
+
+```csharp
+public enum CodeStatus : short
+{
+    NotAsign            = -1,
+
+    Info                = 100,
+    Alert               = 101,
+    Exception           = 102,
+    IsCancelled         = 103,
+
+    Succes              = 200,
+
+    Execute             = 300,
+    ExecuteInternal     = 301,
+    CheckExecution      = 303,
+    CancelByRequest     = 304,
+    CancelByAction      = 305,
+
+    ClientError         = 400,
+    BadRequest          = 401,
+    NotFound            = 404,
+    ActionNotFound      = 440,
+    [Obsolete] SubActionNotFound = 441,
+    ActionNotInitiated  = 442,
+    AccessDenied        = 450,
+    ErrorSoliciteMemory    = 470,
+    AlreadyExistsPetition  = 471,
+
+    InternalWorkerError    = 500,
+    ExecutionException     = 501,
+    ErrorNotPayload        = 502,
+    SerializeError         = 503,
+    AccesNullOrNotExist    = 504,
+    OverMaximumTime        = 550,
+    OverMaximunPacket      = 551,
+    ErrorGetPaylaodMemory  = 571,
+    ErrorReleaseMemory     = 572,
+}
+```

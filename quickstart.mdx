@@ -1,47 +1,209 @@
 ---
-title: "Quickstart"
-description: "Begin with a guide on the fastest path to a successful outcome"
+title: "Get Started with Terbin in 5 Minutes"
+sidebarTitle: "Quickstart"
+description: "Build and connect your first Terbin server and client: register executable handlers, send packets, and receive responses over a named pipe."
 ---
 
-Describe how someone begins using your product. What is the first thing they need to do? Are there any prerequisites?
-
-A quickstart should take someone from zero to using your product. They'll get a quick win and a sense of what they can accomplish.
-
-## Prerequisites
-
-Before you begin, you must have:
-
-- Requirement one (for example, Node.js 18+, a free account, an API key)
-- Requirement two (for example, a compatible device, a compatible browser, a compatible operating system)
-
-## Get started
+By the end of this guide you will have a Terbin service listening on a named pipe, a client connecting to it, a `[TerbinExecutable]`-decorated handler running on the server, and a round-trip packet exchange you can inspect in the console. No external dependencies are required beyond the .NET SDK.
 
 <Steps>
-  <Step title="Install">
-    Describe how to install your product or sign up.
 
-    ```bash
-    npm install your-package
-    ```
-  </Step>
-  <Step title="Configure">
-    Describe any setup or configuration needed before first use.
+### Clone and Build
 
-    ```bash
-    your-cli init
-    ```
-  </Step>
-  <Step title="Run it">
-    Show the first thing a user does to see it working.
+Clone the repository and open the solution in Visual Studio or your preferred IDE:
 
-    ```bash
-    your-cli start
-    ```
-  </Step>
-</Steps>
+```bash
+git clone https://github.com/FarlandsModdingTeam/TerbinProyect.git
+cd TerbinProyect
+dotnet build TerbinProyect.sln
+```
+
+The solution contains three projects: `TerbinLibrary`, `TerbinService`, and `SimulateClient`. All three must build successfully before you proceed.
+
+### Start the Service
+
+Set `TerbinService` as the startup project and run it, or launch it from the command line:
+
+```bash
+dotnet run --project TerbinService
+```
+
+`TerbinService` uses the .NET Generic Host. Its entry point registers `Worker` as the single hosted service:
+
+```csharp
+// TerbinService/Program.cs
+var builder = Host.CreateApplicationBuilder(args);
+builder.Services.AddHostedService<Worker>();
+
+var host = builder.Build();
+host.Run();
+```
+
+`Worker.ExecuteAsync` immediately creates a `TerbinCommunicator` in **server mode** (`pIsServer: true`), which opens a `NamedPipeServerStream` named `"TerbinPipe"` and begins waiting for a client connection. The `OnNewClientConnect` callback ensures a fresh communicator is prepared for every new client that connects:
+
+```csharp
+// TerbinService/Worker.cs
+protected override async Task ExecuteAsync(CancellationToken pStoppingToken)
+{
+    Cts = CancellationTokenSource.CreateLinkedTokenSource(pStoppingToken);
+    TerbinExecutor.Register(Assembly.GetExecutingAssembly());
+    await autoCreatePipe(Cts.Token);
+}
+
+private async Task autoCreatePipe(CancellationToken pTokenCancellation)
+{
+    var communicator = new TerbinCommunicator(true, pTokenCancellation);
+    communicator.OnRecive += async (pCapsule) =>
+    {
+        CurrentContext.Value = new InfoLocalThreads { Communicator = communicator };
+        return await TerbinExecutableManager.DispatchAsync(
+            pCapsule.Head, pCapsule.Payload, pCapsule.ActionMethod);
+    };
+    communicator.OnNewClientConnect += async () =>
+    {
+        _ = Task.Run(() => autoCreatePipe(pTokenCancellation), pTokenCancellation);
+    };
+}
+```
+
+### Register Your Executables
+
+`TerbinExecutor.Register(Assembly.GetExecutingAssembly())` scans every public and non-public static method in the assembly, finds those decorated with `[TerbinExecutable]`, validates that the signature matches `Task<InfoResponse?>(Header, byte[], CancellationToken)`, and registers them with `TerbinExecutableManager`.
+
+Here is the `Stop` handler that ships with `Worker` as a real example:
+
+```csharp
+// TerbinService/Worker.cs
+[TerbinExecutable((byte)CodeTerbinProtocol.Stop)]
+public static async Task<InfoResponse?> Stop(
+    Header pHead, byte[] pParameters, CancellationToken pToken)
+{
+    _ = Task.Run(async () =>
+    {
+        await Task.Delay(100);
+        Console.WriteLine("[Worker] Execution stoped");
+        if (pToken.IsCancellationRequested) return;
+        _appLifetime?.StopApplication();
+        Cts?.Cancel();
+    });
+    Console.WriteLine("[Worker] Stopping execution...");
+    return InfoResponse.CreateSucces(pHead.IdRequest);
+}
+```
+
+The attribute accepts one or more `byte` values that form the action key. `CodeTerbinProtocol.Stop` resolves to `0`. To add your own handler, follow the same pattern:
+
+```csharp
+[TerbinExecutable((byte)CodeServices.Execute, (byte)CodeServicesSection.Plugin)]
+public static async Task<InfoResponse?> InstallPlugin(
+    Header pHead, byte[] pParameters, CancellationToken pToken)
+{
+    // Deserialize pParameters, call your manager, return a response.
+    return InfoResponse.CreateSucces(pHead.IdRequest);
+}
+```
+
+### Connect a Client
+
+In `SimulateClient`, a `TerbinCommunicator` is created in **client mode** (`pIsServer: false`). Its own executables are registered, an `OnRecive` handler is wired up for incoming server-initiated packets, and `Connect()` performs the pipe handshake:
+
+```csharp
+// SimulateClient/Program.cs
+var communicator = new TerbinCommunicator(false);
+TerbinExecutor.Register(Assembly.GetExecutingAssembly());
+communicator.OnRecive += async p =>
+{
+    return await TerbinExecutableManager.DispatchAsync(
+        p.Head, p.Payload, p.ActionMethod);
+};
+
+if (await communicator.Connect())
+{
+    Console.WriteLine("[Client] ¡Conectado!");
+}
+else
+{
+    Console.WriteLine("[Client] ¡Error de Conexion!");
+    return;
+}
+```
+
+`Connect()` calls `ConnectAsync()` on the underlying `NamedPipeClientStream` and then starts background send and receive loops.
+
+### Send a Packet
+
+Use `Communicate()` to send a packet and await the response, or `Send()` for a fire-and-forget message. Both accept an `IdArray` action key and a `byte[]` payload:
+
+```csharp
+// Ask the server to stop — action byte 0 = CodeTerbinProtocol.Stop
+var stopAction = new IdArray((byte)CodeTerbinProtocol.Stop);
+PacketRequest response = await communicator.Communicate(stopAction, Array.Empty<byte>());
+
+// Fire-and-forget: send without waiting for a reply
+await communicator.Send(
+    new IdArray((byte)CodeServices.Info),
+    Array.Empty<byte>());
+```
+
+`IdArray` accepts `params byte[]`, so you can address multi-byte action keys that map to service/section combinations:
+
+```csharp
+var action = new IdArray(
+    (byte)CodeServices.ReadAll,
+    (byte)CodeServicesSection.Plugin);
+
+PacketRequest result = await communicator.Communicate(action, Array.Empty<byte>());
+```
 
 <Tip>
-  Give people a way to get help. This could be a link to a support page, a chat with a customer support agent, or a forum for your product.
+  `Communicate()` registers a `TaskCompletionSource<PacketRequest>` keyed on the auto-generated `ushort` request ID and blocks the caller until the matching response packet arrives. The wait is bounded by `communicator.MaximumResponseTime` seconds (default `8`, sourced from `TerbinProtocol.MAXIMUS_RESPONSE_TIME`). If the deadline passes, the returned `PacketRequest` has `Head.Status == CodeStatus.OverMaximumTime`.
 
-  Example: Need help? Reach out to us at [support@yourcompany.com](mailto:support@yourcompany.com).
+  `Send()` enqueues the packet and returns immediately — use it for notifications or progress updates where you do not need a reply.
 </Tip>
+
+### Handle the Response
+
+On the **server side**, every handler receives a `Header`, the deserialized `byte[]` payload, and a `CancellationToken`. It must return `Task<InfoResponse?>`. Use the static factory methods on `InfoResponse` to build your reply:
+
+```csharp
+// Signal success with no payload
+return InfoResponse.CreateSucces(pHead.IdRequest);
+
+// Signal success and attach a byte[] result
+return InfoResponse.CreateSucces(pHead.IdRequest, resultBytes);
+
+// Signal a known error status
+return InfoResponse.Create(pHead.IdRequest, CodeStatus.NotFound);
+
+// Signal an internal worker error
+return InfoResponse.CreateInteralError(pHead.IdRequest);
+```
+
+On the **client side**, the `PacketRequest` returned by `Communicate()` contains the full response:
+
+```csharp
+PacketRequest response = await communicator.Communicate(action, payload);
+
+if (response.Head.Status == CodeStatus.Succes)
+{
+    // response.Payload contains the server's returned bytes
+    Console.WriteLine("Success! Payload length: " + response.Payload.Length);
+}
+else
+{
+    Console.WriteLine("Error: " + response.Head.Status);
+}
+```
+
+</Steps>
+
+<Warning>
+  Only **one server instance** runs per pipe name by default. When a client connects to `TerbinCommunicator(true, ...)`, the server's background loop is fully occupied with that session. The `OnNewClientConnect` event exists precisely to address this: subscribe to it and call `autoCreatePipe` (or your equivalent) inside the handler so a new `NamedPipeServerStream` is opened and ready for the next client before the current session ends.
+
+  ```csharp
+  communicator.OnNewClientConnect += async () =>
+  {
+      _ = Task.Run(() => autoCreatePipe(pTokenCancellation), pTokenCancellation);
+  };
+  ```
+</Warning>

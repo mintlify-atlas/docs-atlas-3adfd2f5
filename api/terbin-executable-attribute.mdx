@@ -1,0 +1,233 @@
+---
+title: "[TerbinExecutable] Attribute: Routing Packets to Handlers"
+sidebarTitle: "TerbinExecutable"
+description: "Reference for the TerbinExecutableAttribute — how to annotate static methods to register them as IPC packet handlers keyed by byte action sequences."
+---
+
+`TerbinExecutableAttribute` is the central annotation that wires a static C# method into Terbin's IPC routing engine. When `TerbinExecutor.Register(Assembly)` runs at startup it scans every type in the assembly, finds all methods carrying this attribute, validates their signatures, and registers them as handlers inside `TerbinExecutableManager`. From that moment on, any incoming packet whose action key matches the attribute's byte sequence will be dispatched to the decorated method automatically.
+
+---
+
+## Interfaces
+
+### `IExecutableAttribute`
+
+Every attribute that participates in Terbin's routing system must implement this interface.
+
+<ResponseField name="Action" type="byte[]" required>
+  The byte sequence that identifies this action key. For two-byte keys the convention is `[CodeServices.X, CodeServicesSection.Y]`.
+</ResponseField>
+
+<ResponseField name="Leght" type="int" required>
+  Length of the `Action` array. Derived as `Action.Length`.
+</ResponseField>
+
+<ResponseField name="Dispatcher" type="Type" required>
+  The concrete `IExecutableDispatcher` type responsible for storing and calling handlers registered under this attribute. For `TerbinExecutableAttribute` this is always `typeof(ExecutableDispatcher)`.
+</ResponseField>
+
+### `IExecutableDispatcher`
+
+The contract that every dispatcher must satisfy.
+
+```csharp
+public interface IExecutableDispatcher
+{
+    void Register(IExecutableAttribute pAttribute, TerbinExecutableDelegate pHandler);
+    Task<InfoResponse?> DispatchAsync(Header pHead, byte[] pPayload, IEquatable<IEnumerable<byte>> pActions);
+    void RegisterFromAssembly(Assembly pAssembly);
+}
+```
+
+<ResponseField name="Register" type="void">
+  Adds a single handler for an action key.
+</ResponseField>
+
+<ResponseField name="DispatchAsync" type="Task&lt;InfoResponse?&gt;">
+  Looks up the handler list for `pActions` and invokes it, returning the first non-null `InfoResponse`.
+</ResponseField>
+
+<ResponseField name="RegisterFromAssembly" type="void">
+  Scans an assembly and calls `Register` for every valid decorated method found.
+</ResponseField>
+
+---
+
+## `TerbinExecutableAttribute`
+
+```csharp
+[AttributeUsage(AttributeTargets.Method, AllowMultiple = true)]
+public sealed class TerbinExecutableAttribute : Attribute, IExecutableAttribute
+```
+
+<Note>
+  `AllowMultiple = true` means a single static method can carry multiple `[TerbinExecutable]` attributes with different byte keys, registering itself as a handler for each key simultaneously.
+</Note>
+
+### Constructors
+
+<ParamField path="pAction" type="params byte[]">
+  **Direct byte constructor.** Pass raw byte literals or cast enum values explicitly.
+
+  ```csharp
+  // Single-byte key (protocol-level handler)
+  [TerbinExecutable((byte)CodeTerbinProtocol.Stop)]
+  public static async Task<InfoResponse?> Stop(Header pHead, byte[] pParameters, CancellationToken pToken)
+  { ... }
+
+  // Two-byte key (service + section)
+  [TerbinExecutable((byte)CodeServices.Create, (byte)CodeServicesSection.Instances)]
+  public static async Task<InfoResponse?> CreateInstance(Header pHead, byte[] pParameters, CancellationToken pToken)
+  { ... }
+  ```
+</ParamField>
+
+<ParamField path="pAction" type="params object[]">
+  **Object-array constructor.** Each element is cast to `byte` internally via `Serialineitor.CastToByte`. Throws `OverflowException` if more than 255 elements are provided.
+
+  ```csharp
+  [TerbinExecutable(CodeServices.Read, CodeServicesSection.Instances)]
+  public static async Task<InfoResponse?> GetOne(Header pHead, byte[] pParameters, CancellationToken pToken)
+  { ... }
+  ```
+</ParamField>
+
+---
+
+## Handler Signature
+
+Every method decorated with `[TerbinExecutable]` **must** exactly match the `TerbinExecutableDelegate` signature. Methods that do not pass the signature check are silently skipped during assembly scanning.
+
+```csharp
+// Delegate definition
+public delegate Task<InfoResponse?> TerbinExecutableDelegate(
+    Header pHead,
+    byte[] pParameters,
+    CancellationToken pToken
+);
+```
+
+<ParamField path="pHead" type="Header" required>
+  The packet header. Contains `IdRequest` (used when building responses), `OrderRequest` (fragmentation order), `Status` (`CodeStatus`), and `IdMemory`.
+</ParamField>
+
+<ParamField path="pParameters" type="byte[]" required>
+  Raw payload bytes delivered with the packet. Deserialize with `Serialineitor` as needed.
+</ParamField>
+
+<ParamField path="pToken" type="CancellationToken" required>
+  A per-action cancellation token. Check `pToken.IsCancellationRequested` before any long-running work. This token is cancelled when `CodeStatus.CancelByAction` is received for the same action key.
+</ParamField>
+
+**Return value:** `Task<InfoResponse?>`. Return `null` if no reply should be sent (e.g., fire-and-forget). Use the `InfoResponse.Create*` factory methods to build typed responses.
+
+---
+
+## Multi-Byte Action Keys
+
+In practice, Terbin handlers use two bytes: a *service code* from `CodeServices` and a *section code* from `CodeServicesSection`. This forms a composite key that allows fine-grained routing without collisions.
+
+```csharp
+// Action key = [ 0x14 (Create=20), 0x1E (Instances=30) ]
+[TerbinExecutable((byte)CodeServices.Create, (byte)CodeServicesSection.Instances)]
+public static async Task<InfoResponse?> CreateInstance(
+    Header pHead, byte[] pParameters, CancellationToken pToken)
+{
+    if (pParameters.Length <= 0)
+        return InfoResponse.Create(pHead.IdRequest, CodeStatus.ErrorNotPayload);
+
+    // ... deserialize pParameters, perform work ...
+
+    return InfoResponse.CreateSucces(pHead.IdRequest);
+}
+```
+
+The `ByteArrayKey` struct wraps the `byte[]` and provides value-equality semantics so that `new byte[]{20, 30}` and `new byte[]{20, 30}` hash to the same slot in the `ConcurrentDictionary`.
+
+<Warning>
+  Bytes **0–9** are reserved for `CodeTerbinProtocol` (Stop, Response, Load, Prolong, Solicit, ExceptionAlert, …). Do **not** use values 0–9 as the first byte of an application-level action key. The `TerbinProtocol.RESERVE_PROTOCOL` constant documents this boundary (`= 9`).
+</Warning>
+
+---
+
+## Complete Working Examples
+
+### Minimal service handler (`ServiceInstances.cs`)
+
+```csharp
+internal static class ServiceInstances
+{
+    [TerbinExecutable((byte)CodeServices.ReadAll, (byte)CodeServicesSection.Instances)]
+    public static async Task<InfoResponse?> GetAllInstances(
+        Header pHead, byte[] pParameters, CancellationToken pToken)
+    {
+        List<ReferenceInstance> instances = Manager.Index.GetAllInstances();
+        Serialineitor s = new();
+
+        if (instances.Count <= 0)
+            return InfoResponse.CreateSucces(pHead.IdRequest, [0]);
+
+        s.Add<ThreeQuartersInt>(instances.Count);
+        for (int i = 0; i < instances.Count; i++)
+        {
+            ReferenceInstanceDTO tmp = (ReferenceInstanceDTO)instances[i];
+            s.AddStruct<ReferenceInstanceDTO>(tmp);
+        }
+
+        return InfoResponse.CreateSucces(pHead.IdRequest, s.Serialize());
+    }
+
+    [TerbinExecutable((byte)CodeServices.Deleted, (byte)CodeServicesSection.Instances)]
+    public static async Task<InfoResponse?> DeleteInstances(
+        Header pHead, byte[] pParameters, CancellationToken pToken)
+    {
+        if (pParameters.Length <= 0)
+            return InfoResponse.Create(pHead.IdRequest, CodeStatus.ErrorNotPayload);
+
+        ReadOnlySpan<byte> reader = pParameters;
+        var name = reader.ReadArray<char>().CrString();
+
+        var r = await Manager.Instances.Delete(name, pToken);
+
+        if (r == Manager.Instances.Status.IsCancelled)
+            return InfoResponse.CreateCancelled(pHead.IdRequest);
+
+        return InfoResponse.CreateSucces(pHead.IdRequest);
+    }
+}
+```
+
+### Protocol-level Stop handler (`Worker.cs`)
+
+```csharp
+[TerbinExecutable((byte)CodeTerbinProtocol.Stop)]
+public static async Task<InfoResponse?> Stop(
+    Header pHead, byte[] pParameters, CancellationToken pToken)
+{
+    _ = Task.Run(async () =>
+    {
+        await Task.Delay(100);
+        Console.WriteLine("[Worker] Execution stoped");
+        if (pToken.IsCancellationRequested) return;
+        _appLifetime?.StopApplication();
+        Cts?.Cancel();
+    });
+    Console.WriteLine("[Worker] Stopping execution...");
+    return InfoResponse.CreateSucces(pHead.IdRequest);
+}
+```
+
+---
+
+## Obsolete Variant
+
+<Note>
+  `TerbinExecutable_ObsoleteAttribute` accepts a single `byte pAction` and targets `ExecutableDispatcherSimple`. It is marked `[Obsolete]` and should not be used in new code. Use `TerbinExecutableAttribute` with `ExecutableDispatcher` instead.
+</Note>
+
+---
+
+## See Also
+
+- [ExecutableDispatcher](/api/executable-dispatcher) — the thread-safe routing engine that stores and calls registered handlers.
+- [TerbinExecutor](/api/terbin-executor) — the static scanner that seeds `TerbinExecutableManager` from assemblies.

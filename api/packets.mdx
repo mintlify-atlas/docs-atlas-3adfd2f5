@@ -1,0 +1,345 @@
+---
+title: "Packet Types: Header, PacketRequest, and IdArray"
+sidebarTitle: "Packets"
+description: "Reference for the core packet types in Terbin's binary protocol: Header struct, PacketRequest, and IdArray action byte sequences."
+---
+
+Every message that flows through a Terbin named pipe is encoded as a `PacketRequest` — a binary struct composed of a fixed-size `Header` for routing metadata, an `IdArray` that identifies the target action handler, and a variable-length `byte[]` payload. This page documents all three types, plus the `ExceptionDTO` struct used to transmit exception details over the wire.
+
+---
+
+## Header
+
+`Header` is an unmanaged, sequential struct (`[StructLayout(LayoutKind.Sequential, Pack = 1)]`) that carries the routing and control metadata for every packet. Its fixed layout ensures byte-perfect serialization without alignment padding.
+
+```csharp
+[StructLayout(LayoutKind.Sequential, Pack = 1)]
+public struct Header
+{
+    public ushort IdRequest;
+    public ushort OrderRequest;
+    public CodeStatus Status;
+    public byte IdMemory;
+}
+```
+
+### Fields
+
+<ParamField path="IdRequest" type="ushort">
+  Numeric identifier shared by a request and its matching response. Callers use this to correlate `Communicate()` calls with their replies. If a value of `0` is passed to the constructor it is internally clamped to `1`.
+</ParamField>
+
+<ParamField path="OrderRequest" type="ushort">
+  Sequence number for fragment assembly.
+  - `0` (`TerbinProtocol.ORDER_SINGLE`) — standalone, unfragmented packet.
+  - `1` — first fragment of a multi-part message.
+  - `ushort.MaxValue` (`TerbinProtocol.FINAL_PACKET`) — last fragment; triggers reassembly on the receiver.
+</ParamField>
+
+<ParamField path="Status" type="CodeStatus">
+  Execution status code stamped into the header. Outbound packets typically use `CodeStatus.Execute`; responses use `CodeStatus.Succes`, error codes (4xx / 5xx range), or control codes such as `CodeStatus.IsCancelled`.
+</ParamField>
+
+<ParamField path="IdMemory" type="byte">
+  Identifies the remote memory slot used during fragment reassembly. Set to `CodeTerbinMemory.NotAsign` for single-packet messages. Fragment upload packets carry the memory ID returned by `SoliciteRequestMemory()`.
+</ParamField>
+
+### Constructor
+
+```csharp
+public Header(
+    ushort pIdRequest      = 0,
+    ushort pOrderRequest   = TerbinProtocol.ORDER_SINGLE,
+    CodeStatus pStatus     = CodeStatus.NotAsign,
+    byte pIdMemory         = (byte)CodeTerbinMemory.Undefined)
+```
+
+All parameters are optional. A `pIdRequest` of `0` is silently promoted to `1`.
+
+```csharp
+// Minimal header for a single execute packet
+var header = new Header(
+    pIdRequest:    MiniID.NewS,
+    pOrderRequest: TerbinProtocol.ORDER_SINGLE,
+    pStatus:       CodeStatus.Execute,
+    pIdMemory:     (byte)CodeTerbinMemory.NotAsign);
+```
+
+### IsSucces
+
+```csharp
+public readonly bool IsSucces => Status == CodeStatus.Succes;
+```
+
+Convenience shorthand. Equivalent to checking `Status == CodeStatus.Succes`.
+
+---
+
+## PacketRequest
+
+`PacketRequest` is the top-level packet struct that is serialized and written to the pipe by `StreamWriteStruct` / read by `StreamReadStruct`. It implements `IStructSerializable` for binary round-tripping.
+
+```csharp
+[StructLayout(LayoutKind.Sequential)]
+public struct PacketRequest : IStructSerializable
+{
+    public Header   Head;
+    public IdArray  ActionMethod;
+    public byte[]   Payload;
+}
+```
+
+### Fields
+
+<ParamField path="Head" type="Header">
+  The routing and control header. Contains request ID, fragment order, status code, and memory slot ID.
+</ParamField>
+
+<ParamField path="ActionMethod" type="IdArray">
+  The action routing key. On the receiver, `TerbinExecutor` uses this byte sequence to look up the registered `[TerbinExecutable]` handler. A special value of `new IdArray((byte)CodeTerbinProtocol.Response)` marks the packet as a response rather than a new request.
+</ParamField>
+
+<ParamField path="Payload" type="byte[]">
+  The data body of the packet. For fragmented transfers this is one chunk of the full message; after reassembly the merged bytes are placed back into `Payload` before `OnRecive` fires.
+</ParamField>
+
+### Constructor
+
+```csharp
+public PacketRequest(
+    Header?   pHead         = null,
+    IdArray?  pActionMethod = null,
+    byte[]?   pPayload      = null)
+```
+
+All parameters are optional and fall back to safe defaults (`Header()`, `IdArray(CodeTerbinProtocol.Response)`, `[]`).
+
+### IsSucces
+
+```csharp
+public readonly bool IsSucces => Head.IsSucces;
+```
+
+Delegates to `Head.IsSucces`.
+
+### Static Factory Methods
+
+#### CreateResponseError
+
+```csharp
+public static PacketRequest CreateResponseError(ushort pIdRequest, CodeStatus pError)
+```
+
+Builds a minimal response packet with no payload, marking it with the supplied error status. Commonly used to return early from `HandleSendFragment()` when the operation cannot proceed.
+
+<ParamField path="pIdRequest" type="ushort" required>
+  The request ID of the original failed request.
+</ParamField>
+<ParamField path="pError" type="CodeStatus" required>
+  The error status to embed (e.g., `CodeStatus.OverMaximunPacket`, `CodeStatus.NotFound`).
+</ParamField>
+
+#### CreateResponseSucces
+
+```csharp
+public static PacketRequest CreateResponseSucces(ushort pIdRequest)
+```
+
+Builds a minimal success response packet with no payload.
+
+#### CreateResponse
+
+```csharp
+public static PacketRequest CreateResponse(Header pHead, byte[]? pPayload = null)
+```
+
+Assembles a general response from a given header, setting `IdMemory = NotAsign`, `OrderRequest = ORDER_SINGLE`, and `ActionMethod = CodeTerbinProtocol.Response`. The lower-level primitive that the other factory methods delegate to.
+
+---
+
+## IdArray
+
+`IdArray` is a variable-length byte wrapper that serves as both the **action routing key** (the `ActionMethod` field of `PacketRequest`) and the **handler registration key** for `[TerbinExecutable]` attributes. It implements `IEquatable<IEnumerable<byte>>` so it works seamlessly as a dictionary key.
+
+```csharp
+[StructLayout(LayoutKind.Sequential)]
+public struct IdArray
+    : IStructSerializable,
+      ICollection<byte>,
+      IEquatable<IdArray>,
+      IEquatable<IEnumerable<byte>>
+```
+
+<Note>
+  The maximum length of an `IdArray` is 255 bytes (`byte.MaxValue`). Attempting to create or grow one beyond this limit throws `OverflowException`.
+</Note>
+
+### Constructor
+
+```csharp
+public IdArray(params byte[] pAction)
+```
+
+Creates an `IdArray` from a variable list of byte literals or cast enum values.
+
+```csharp
+// Two-byte action key: service category + sub-action
+var key = new IdArray(
+    (byte)CodeServices.Plugin,
+    (byte)CodeServicesSection.Install);
+```
+
+An overload accepts `params object[]` and uses `Serialineitor.CastToByte` to convert each element, enabling direct use of enums without an explicit cast:
+
+```csharp
+var key = new IdArray(CodeServices.Plugin, CodeServicesSection.Install);
+```
+
+### Indexer
+
+```csharp
+public readonly byte this[byte pIndex] { get; set; }
+```
+
+Zero-based byte-index access into the underlying array.
+
+### Implicit Conversions
+
+| From | To | Description |
+|------|----|-------------|
+| `byte[]` | `IdArray` | Wrap a raw byte array |
+| `ByteArrayKey` | `IdArray` | Convert from a dictionary key wrapper |
+| `IdArray` | `ByteArrayKey` | Convert to a dictionary key wrapper |
+| `IdArray` | `byte[]` | Unwrap to raw bytes |
+
+### Equality
+
+Two `IdArray` values are equal if and only if their underlying byte sequences are equal (`SequenceEqual`). `GetHashCode()` computes a stable polynomial hash over the bytes, making `IdArray` safe as a `Dictionary<IdArray, …>` key.
+
+```csharp
+var a = new IdArray(0x01, 0x02);
+var b = new IdArray(0x01, 0x02);
+Console.WriteLine(a == b); // true
+```
+
+### Key Collection Methods
+
+| Method | Description |
+|--------|-------------|
+| `Add(byte item)` | Appends a byte, resizing the array. Throws `OverflowException` at 255. |
+| `Remove(byte item)` | Removes the first occurrence of a byte. |
+| `Contains(byte item)` | Returns `true` if the byte exists in the array. |
+| `SetAction(params byte[] pActionMethod)` | Replaces the entire underlying array. |
+| `Clear()` | Zeroes all elements (does not resize). |
+| `CopyTo(byte[] array, int index)` | Copies bytes into a destination array. |
+
+---
+
+## ExceptionDTO
+
+`ExceptionDTO` is a serializable struct used to transmit the details of a .NET exception across the pipe as a payload. It is sent with `CodeStatus.Exception` or `CodeStatus.ExecutionException` so the receiving end can log or display the error.
+
+```csharp
+public struct ExceptionDTO() : IStructSerializable
+{
+    public string Site    = "";
+    public string Message = "";
+    public string Source  = "";
+    public string Inner   = "";
+    public string Trace   = "";
+    public string String  = "";
+}
+```
+
+### Fields
+
+<ParamField path="Site" type="string">
+  A developer-supplied label identifying where in the codebase the exception occurred (e.g., `"PluginService>Install"`).
+</ParamField>
+
+<ParamField path="Message" type="string">
+  Maps to `Exception.Message`.
+</ParamField>
+
+<ParamField path="Source" type="string">
+  Maps to `Exception.Source`. Falls back to `"N/A"` when null.
+</ParamField>
+
+<ParamField path="Inner" type="string">
+  Maps to `Exception.InnerException?.Message`. Falls back to `"N/A"` when null.
+</ParamField>
+
+<ParamField path="Trace" type="string">
+  Maps to `Exception.StackTrace`. Falls back to `"N/A"` when null.
+</ParamField>
+
+<ParamField path="String" type="string">
+  Maps to `Exception.ToString()` — the full formatted exception string including inner exceptions.
+</ParamField>
+
+### Constructor
+
+```csharp
+public ExceptionDTO(Exception pE, string pSite) : this()
+```
+
+Captures all fields from the provided exception and the developer-supplied site label.
+
+---
+
+## Building a Packet Manually
+
+The example below constructs a complete `PacketRequest` by hand, showing how all three core types compose together.
+
+```csharp
+// 1. Choose a request ID
+ushort requestId = MiniID.NewS;
+
+// 2. Build the header
+var header = new Header(
+    pIdRequest:    requestId,
+    pOrderRequest: TerbinProtocol.ORDER_SINGLE,   // single, unfragmented
+    pStatus:       CodeStatus.Execute,
+    pIdMemory:     (byte)CodeTerbinMemory.NotAsign);
+
+// 3. Define the action routing key
+//    This must match the IdArray registered on the [TerbinExecutable] handler
+var action = new IdArray(
+    (byte)CodeServices.Plugin,
+    (byte)CodeServicesSection.Read);
+
+// 4. Prepare the payload
+byte[] payload = System.Text.Encoding.UTF8.GetBytes("BepInEx");
+
+// 5. Assemble the packet
+var packet = new PacketRequest(
+    pHead:         header,
+    pActionMethod: action,
+    pPayload:      payload);
+
+// 6. Enqueue it directly (or hand it to Send / Communicate)
+await communicator.addQueue(packet);
+```
+
+<Accordion title="Sending an exception over the pipe">
+
+```csharp
+try
+{
+    // ... some risky operation ...
+}
+catch (Exception ex)
+{
+    var dto = new ExceptionDTO(ex, "PluginService>Install");
+
+    // Serialize the DTO to bytes using your project's serializer
+    byte[] errorPayload = Serialineitor.SerializeStructRaw(dto);
+
+    await communicator.Send(
+        new IdArray((byte)CodeTerbinProtocol.ExceptionAlert),
+        errorPayload,
+        CodeStatus.ExecutionException);
+}
+```
+
+</Accordion>

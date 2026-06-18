@@ -1,0 +1,352 @@
+---
+title: "Plugin Service: Download, Install, List, and Remove Mods"
+sidebarTitle: "Plugins"
+description: "ServicePlugins manages the full plugin lifecycle per game instance: downloading from URL, installing into an instance path, listing installed plugins, and uninstalling."
+---
+
+`ServicePlugins` is a static handler class that orchestrates the full lifecycle of a mod (plugin) as it relates to a specific game instance. It delegates network and filesystem work to `Manager.Plugin`, `Manager.Instances`, and `Manager.StoragePlugin`. Plugins travel through two distinct layers before they are active in a game: the **Plugin Storage** (a global archive) and the **instance manifest** (a per-instance record of what is installed where).
+
+## Key Concepts
+
+**`Id` vs `IdLocal`**
+
+Each plugin manifest carries two identifiers:
+
+- **`Id`** (storage ID) — The `Guid` assigned when the plugin archive is first downloaded and stored in the global Plugin Storage. This ID links back to a `ReferencePluginStore` entry and is stable across instances.
+- **`IdLocal`** (local ID) — A fresh `Guid` generated at install time by `Manager.Manifest.HandleAddPlugin`. This ID uniquely identifies *this installation* of the plugin inside *this instance*, allowing the same plugin (same `Id`) to be installed multiple times under different `IdLocal` values.
+
+**`OutSideIntance`**
+
+A `bool?` flag indicating whether the plugin was extracted to a path outside the instance directory root. When `true`, paths inside `DirectoryHandwritten` are absolute rather than relative to the instance.
+
+**`DirectoryHandwritten`**
+
+Tracks every file and directory created during extraction. This log is read back during uninstallation by `NodeUtil.DeleteFromHandwritten` to reverse the operation precisely.
+
+## Data Models
+
+### ManifestPlugin
+
+| Field | Type | Description |
+|---|---|---|
+| `Name` | `string?` | Human-readable mod name derived from the archive filename. |
+| `Id` | `string?` | Storage-layer Guid (links to `ReferencePluginStore`). |
+| `IdLocal` | `string?` | Install-time Guid unique to this instance installation. |
+| `OutSideIntance` | `bool?` | `true` if installed outside the instance root directory. |
+| `HandWritten` | `DirectoryHandwritten` | Tree of all files and directories extracted during install. |
+
+### ManifestPluginDTO (wire format)
+
+| Field | Type | Wire encoding |
+|---|---|---|
+| `Name` | `string?` | Length-prefixed UTF-16 char array |
+| `Id` | `string?` | Length-prefixed UTF-16 char array |
+| `IdLocal` | `string?` | Length-prefixed UTF-16 char array |
+| `OutSideIntance` | `bool?` | `sbyte` via `ToSByte()` / `ToBoolUk()` |
+
+---
+
+## Operations
+
+<Accordion title="DowloadPlugin — (CodeServices.Dowload, CodeServicesSection.Plugin)">
+
+Downloads a plugin archive from a URL and stores it in the global Plugin Storage. The service first calls `NetUtil.GetContentLength` to determine the total download size, then calls `Manager.Plugin.DowloadOne`, which streams the file to a temporary path before moving it to storage and registering a `ReferencePluginStore` entry.
+
+<Note>
+  This operation is marked **TODO** in the source — a future refactor will move it to `ServicePluginStorage`, and an existence check before overwriting will be added.
+</Note>
+
+**Action bytes:** `(byte)CodeServices.Dowload` = `13`, `(byte)CodeServicesSection.Plugin` = `20`
+
+### Request Payload
+
+<ParamField body="urlPlugin" type="char[]" required>
+  The full download URL for the plugin archive, encoded as a length-prefixed UTF-16 char array.
+</ParamField>
+
+<ParamField body="useProgress" type="bool">
+  Optional. When `true` (and the remaining buffer length is ≥ 1), the service sets up a `MaxProgressDTO` containing the file's content-length and calls `ProgressUtil.CreateProgressAndSetMax` to wire progress reporting back to the caller on `(CodeServices.Dowload, CodeServicesSection.Plugin)`.
+</ParamField>
+
+### Progress Reporting
+
+When `useProgress` is `true`, the client receives two extra IPC messages before the final response:
+
+1. **`SetMaxProgress`** (`CodeServicesClient.SetMaxProgress`) — sent once with the total byte count (`long sizePlugin`).
+2. **`SetBarProgress`** (`CodeServicesClient.SetBarProgress`) — sent repeatedly during download with a `TerbinInfoProgrss` struct (`Percentage`, `Current`, `Finish`).
+
+### Response
+
+On success the response body is **empty**.
+
+### Error Conditions
+
+| `InternalErrors` value | Code | Meaning |
+|---|---|---|
+| `PluginNotConect` | `201` | `NetUtil.GetContentLength` returned `null` — the URL is unreachable or returned no content-length header. |
+| `PluginNotSuchSpace` | `203` | Not enough disk space for the download (`Manager.Plugin.Status.NotSuchSpace`). |
+| `PluginInvalidURL` | `204` | The URL is malformed or the host rejected it (`Status.InvalidURL`). |
+| `PluginOnDowload` | `202` | Any other network or I/O failure during the download (`Status.ErrorOnDowload`). |
+
+### Example
+
+```csharp
+string url = "https://example.com/mods/MyMod-1.2.3.zip";
+
+Serialineitor s = new();
+s.AddArray<char>(url.ToCharArray());
+s.Add<bool>(true); // request progress updates
+
+var response = await client.Communicate(
+    (byte)CodeServices.Dowload,
+    (byte)CodeServicesSection.Plugin,
+    s.Serialize()
+);
+
+if (response.Status == CodeStatus.Succes)
+    Console.WriteLine("Plugin downloaded to storage.");
+```
+
+</Accordion>
+
+<Accordion title="InstallPlugin — (CodeServices.Install, CodeServicesSection.Plugin)">
+
+Extracts a previously downloaded plugin from storage into a specific path within a named instance. The service resolves the instance path via `Manager.Instances.GetPathFolder`, combines it with `relativePath`, and then calls `Manager.Plugin.InstallOne`. On success, a `ManifestPlugin` JSON file is written and a `ReferencePlugin` is appended to the instance's `ManifestInstance`.
+
+**Action bytes:** `(byte)CodeServices.Install` = `14`, `(byte)CodeServicesSection.Plugin` = `20`
+
+### Request Payload
+
+<ParamField body="name" type="char[]" required>
+  The name of the target instance, encoded as a length-prefixed UTF-16 char array.
+</ParamField>
+
+<ParamField body="idPlugin" type="char[]" required>
+  The storage-layer ID (`Guid` as string) of the plugin to install. Must match a `ReferencePluginStore.Id` in the global storage index.
+</ParamField>
+
+<ParamField body="relativePath" type="char[]" required>
+  The relative path inside the instance directory where the plugin archive will be extracted (e.g., `BepInEx/plugins/MyMod`).
+</ParamField>
+
+<ParamField body="useProgress" type="bool">
+  Optional. When `true`, the service reads the uncompressed size from `Manager.StoragePlugin.GetSize(idPlugin)` and calls `ProgressUtil.CreateProgressAndSetMax` to send progress updates on `(CodeServices.Dowload, CodeServicesSection.Plugin)`.
+</ParamField>
+
+### Progress Reporting
+
+Identical to `DowloadPlugin`: a `SetMaxProgress` message followed by repeated `SetBarProgress` ticks carrying `TerbinInfoProgrss`.
+
+### Response
+
+On success the response body is **empty**.
+
+### Error Conditions
+
+| `InternalErrors` value | Code | Meaning |
+|---|---|---|
+| `InstanceNotExist` | `302` | The named instance was not found in the index. |
+| `PluginGetPath` | `207` | Could not resolve the physical path for the plugin archive (`Status.ErrorGetPathPlugin`). |
+| `PluginGetManifest` | `209` | Could not read or create the instance manifest after extraction (`Status.ErrorGetManifest`). |
+| `PluginOnSave` | `208` | Failed to persist the plugin's `ManifestPlugin` JSON file (`Status.ErrorOnSaveManifest`). |
+| `PluginNotExist` | `205` | The `idPlugin` was not found in plugin storage (`Status.ErrorGetPlugin` or unrecognised status). |
+
+<Note>
+  If the operation is cancelled mid-extraction, `Manager.Instances.UnistallPlugin` is automatically called on the partial result to clean up any extracted files, and `Manager.Manifest.HandleRemovePlugin` removes the partially-registered reference.
+</Note>
+
+### Example
+
+```csharp
+Serialineitor s = new();
+s.AddArray<char>("MyInstance".ToCharArray());
+s.AddArray<char>("a1b2c3d4e5f6...".ToCharArray()); // idPlugin (Guid N-format)
+s.AddArray<char>("BepInEx/plugins/MyMod".ToCharArray());
+s.Add<bool>(true); // request progress
+
+var response = await client.Communicate(
+    (byte)CodeServices.Install,
+    (byte)CodeServicesSection.Plugin,
+    s.Serialize()
+);
+
+if (response.Status == CodeStatus.Succes)
+    Console.WriteLine("Plugin installed into instance.");
+```
+
+</Accordion>
+
+<Accordion title="GetAll — (CodeServices.ReadAll, CodeServicesSection.Plugin)">
+
+Lists all `ManifestPluginDTO` records for every plugin installed in the named instance. The service resolves the instance path, loads the instance manifest, then iterates `ManifestInstance.Plugins` to deserialize each individual plugin JSON file via `Manager.Plugin.GetAll`.
+
+**Action bytes:** `(byte)CodeServices.ReadAll`, `(byte)CodeServicesSection.Plugin` = `20`
+
+### Request Payload
+
+<ParamField body="nameInstance" type="char[]" required>
+  The name of the instance whose plugins should be listed.
+</ParamField>
+
+### Response Payload
+
+If no plugins are installed the response contains a single zero byte (`[0]`).
+
+Otherwise:
+
+<ResponseField name="count" type="ThreeQuartersInt">
+  Number of installed plugins.
+</ResponseField>
+
+<ResponseField name="plugins[]" type="ManifestPluginDTO[]">
+  Array of `count` consecutive `ManifestPluginDTO` structs. Each contains `Name`, `Id`, `IdLocal`, and `OutSideIntance`.
+</ResponseField>
+
+### Error Conditions
+
+| `InternalErrors` value | Code | Meaning |
+|---|---|---|
+| `InstanceNotExist` | `302` | Instance not found or path could not be resolved. |
+| `ManifestGet` | `903` | The instance's `ManifestInstance` JSON file could not be deserialized. |
+
+### Example
+
+```csharp
+Serialineitor s = new();
+s.AddArray<char>("MyInstance".ToCharArray());
+
+var response = await client.Communicate(
+    (byte)CodeServices.ReadAll,
+    (byte)CodeServicesSection.Plugin,
+    s.Serialize()
+);
+
+if (response.Status == CodeStatus.Succes && response.Payload.Length > 1)
+{
+    ReadOnlySpan<byte> reader = response.Payload;
+    int count = reader.Read<ThreeQuartersInt>();
+    for (int i = 0; i < count; i++)
+    {
+        ManifestPluginDTO dto = reader.ReadStruct<ManifestPluginDTO>();
+        Console.WriteLine($"{dto.Name} [{dto.IdLocal}]");
+    }
+}
+```
+
+</Accordion>
+
+<Accordion title="GetOne — (CodeServices.Read, CodeServicesSection.Plugin)">
+
+Fetches the `ManifestPluginDTO` for a single plugin installed in an instance, identified by its `IdLocal`. The service loads the instance manifest and searches `ManifestInstance.Plugins` for a matching `ReferencePlugin.IdLocal`, then deserializes the corresponding plugin JSON file.
+
+**Action bytes:** `(byte)CodeServices.Read`, `(byte)CodeServicesSection.Plugin` = `20`
+
+### Request Payload
+
+<ParamField body="name" type="char[]" required>
+  The instance name.
+</ParamField>
+
+<ParamField body="id" type="char[]" required>
+  The `IdLocal` of the installed plugin (the install-time Guid, **not** the storage `Id`).
+</ParamField>
+
+### Response Payload
+
+On success the entire body is a serialized `ManifestPluginDTO`:
+
+<ResponseField name="Name" type="string">Mod name.</ResponseField>
+<ResponseField name="Id" type="string">Storage-layer Guid.</ResponseField>
+<ResponseField name="IdLocal" type="string">Install-time local Guid.</ResponseField>
+<ResponseField name="OutSideIntance" type="bool?">Whether installed outside the instance root.</ResponseField>
+
+### Error Conditions
+
+| `InternalErrors` value | Code | Meaning |
+|---|---|---|
+| `InstanceNotExist` | `302` | Instance not found or path could not be resolved. |
+| `ManifestGet` | `903` | Instance manifest could not be deserialized. |
+| `PluginGet` | `206` | The plugin was not found in the instance manifest, or its individual JSON file could not be read. |
+
+### Example
+
+```csharp
+Serialineitor s = new();
+s.AddArray<char>("MyInstance".ToCharArray());
+s.AddArray<char>("localGuidHere".ToCharArray()); // IdLocal
+
+var response = await client.Communicate(
+    (byte)CodeServices.Read,
+    (byte)CodeServicesSection.Plugin,
+    s.Serialize()
+);
+
+if (response.Status == CodeStatus.Succes)
+{
+    ManifestPluginDTO dto = new();
+    dto.ReadFrom(response.Payload);
+    Console.WriteLine($"Name={dto.Name}, Id={dto.Id}");
+}
+```
+
+</Accordion>
+
+<Accordion title="Delete — (CodeServices.Deleted, CodeServicesSection.Plugin)">
+
+Uninstalls a plugin from an instance. The service first resolves the `ManifestPlugin` via its `IdLocal`, then calls `Manager.Plugin.UnistallOne` which uses `DirectoryHandwritten` to reverse-delete every file and directory the plugin created, and finally calls `Manager.Manifest.HandleRemovePlugin` to remove the `ReferencePlugin` entry from the instance manifest and delete the plugin's individual JSON file.
+
+**Action bytes:** `(byte)CodeServices.Deleted`, `(byte)CodeServicesSection.Plugin` = `20`
+
+### Request Payload
+
+<ParamField body="name" type="char[]" required>
+  The instance name.
+</ParamField>
+
+<ParamField body="id" type="char[]" required>
+  The `IdLocal` of the plugin installation to remove.
+</ParamField>
+
+<ParamField body="useProgress" type="bool">
+  Optional. When `true`, the service reads `mani.HandWritten.GetSize()` (total number of items to delete) and calls `ProgressUtil.CreateProgressAndSetMax` to send progress ticks on `(CodeServices.Deleted, CodeServicesSection.Plugin)`.
+</ParamField>
+
+### Progress Reporting
+
+When `useProgress` is `true`, the client receives a `SetMaxProgress` message with the total file/directory count, followed by `SetBarProgress` ticks during deletion.
+
+### Response
+
+On success the response body is **empty**.
+
+### Error Conditions
+
+| `InternalErrors` value | Code | Meaning |
+|---|---|---|
+| `InstanceNotExist` | `302` | Instance not found or path could not be resolved. |
+| `ManifestGet` | `903` | Instance manifest could not be deserialized. |
+| `PluginGet` | `206` | The plugin `IdLocal` was not found in the instance manifest. |
+
+<Warning>
+  Uninstallation is irreversible. The `DirectoryHandwritten` log is used to remove every file the plugin placed on disk. Files that were manually modified after installation are still deleted.
+</Warning>
+
+### Example
+
+```csharp
+Serialineitor s = new();
+s.AddArray<char>("MyInstance".ToCharArray());
+s.AddArray<char>("localGuidHere".ToCharArray()); // IdLocal
+s.Add<bool>(true); // request progress
+
+var response = await client.Communicate(
+    (byte)CodeServices.Deleted,
+    (byte)CodeServicesSection.Plugin,
+    s.Serialize()
+);
+
+if (response.Status == CodeStatus.Succes)
+    Console.WriteLine("Plugin uninstalled.");
+```
+
+</Accordion>

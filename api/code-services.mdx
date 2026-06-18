@@ -1,0 +1,299 @@
+---
+title: "CodeServices and CodeServicesSection: Action Routing Enums"
+sidebarTitle: "CodeServices"
+description: "Reference for CodeServices and CodeServicesSection enums — the two-byte action keys that route packets to the correct service handler."
+---
+
+Every service packet in Terbin is routed by a two-byte action key stored in an `IdArray`. The first byte comes from `CodeServices` (what kind of operation is being performed) and the second byte comes from `CodeServicesSection` (which domain or resource the operation targets). The two values are composed as:
+
+```csharp
+var action = new IdArray((byte)CodeServices.Read, (byte)CodeServicesSection.Plugin);
+```
+
+The dispatcher matches this `IdArray` against the registered `[TerbinExecutable]` attributes to find the correct handler. Getting both bytes right is the only thing required to route a packet.
+
+---
+
+## `CodeServices` enum (`byte`)
+
+`CodeServices` represents the _verb_ of a request — what the client wants to do. Values `10`–`14` cover general service operations; values `250`–`255` are CRUD aliases that mirror `TerbinCRUD` constants from `TerbinLibrary.Protocol`.
+
+```csharp
+public enum CodeServices : byte
+{
+    Info      = 10,
+    Alert     = 11,
+    Execute   = 12,
+    Dowload   = 13,
+    Install   = 14,
+
+    ReadAll   = TerbinCRUD.ReadAll,   // 250
+    Duplicate = TerbinCRUD.Duplicate, // 251
+    Create    = TerbinCRUD.Create,    // 252
+    Read      = TerbinCRUD.Read,      // 253
+    Update    = TerbinCRUD.Update,    // 254
+    Deleted   = TerbinCRUD.Deleted,   // 255
+}
+```
+
+| Value | Name | Description |
+|-------|------|-------------|
+| `10` | `Info` | Request informational data from a service. |
+| `11` | `Alert` | Push an alert or notification to a service. |
+| `12` | `Execute` | Trigger a service-level execution (e.g. launch a process). |
+| `13` | `Dowload` | Initiate a download operation within the service. |
+| `14` | `Install` | Initiate an install operation within the service. |
+| `250` | `ReadAll` | Retrieve all records from the target section. Aliases `TerbinCRUD.ReadAll`. |
+| `251` | `Duplicate` | Duplicate an existing record. Aliases `TerbinCRUD.Duplicate`. |
+| `252` | `Create` | Create a new resource. Aliases `TerbinCRUD.Create`. |
+| `253` | `Read` | Read a single resource. Aliases `TerbinCRUD.Read`. |
+| `254` | `Update` | Update an existing resource. Aliases `TerbinCRUD.Update`. |
+| `255` | `Deleted` | Delete a resource. Aliases `TerbinCRUD.Deleted`. |
+
+### `TerbinCRUD` constants
+
+The CRUD tail of `CodeServices` is backed by the `TerbinCRUD` enum in `TerbinLibrary.Protocol`. Use `TerbinCRUD` directly when you want to reference these operations independently of `CodeServices`:
+
+```csharp
+public enum TerbinCRUD : byte
+{
+    ReadAll   = 250,
+    Duplicate = 251,
+    Create    = 252,
+    Read      = 253,
+    Update    = 254,
+    Deleted   = 255,
+}
+```
+
+| Value | Name |
+|-------|------|
+| `250` | `ReadAll` |
+| `251` | `Duplicate` |
+| `252` | `Create` |
+| `253` | `Read` |
+| `254` | `Update` |
+| `255` | `Deleted` |
+
+---
+
+## `CodeServicesSection` enum (`byte`)
+
+`CodeServicesSection` represents the _noun_ — the domain or subsystem that owns the handler. It is the second byte in the action `IdArray`.
+
+```csharp
+public enum CodeServicesSection : byte
+{
+    Game          = 10,
+    Plugin        = 20,
+    PluginStorage = 21,
+    Instances     = 30,
+    FCM           = 40,
+    Rute          = 50,
+}
+```
+
+| Value | Name | Domain |
+|-------|------|--------|
+| `10` | `Game` | Game management — launching, registering, and duplicating game entries. |
+| `20` | `Plugin` | Plugin management — install, uninstall, list, and query plugins. |
+| `21` | `PluginStorage` | Plugin storage layer — persistent plugin data and store manifests. |
+| `30` | `Instances` | Game instance management — create, read, list, and remove instances. |
+| `40` | `FCM` | Firebase Cloud Messaging integration. |
+| `50` | `Rute` | Route/path management — resolve and persist game and asset paths. |
+
+<Note>
+  The older `CodeSubServices` enum is **`[Obsolete]`**. It has the same values as `CodeServicesSection` and should not be used in new code. Migrate any `CodeSubServices` references to `CodeServicesSection`.
+</Note>
+
+---
+
+## `CodeServicesClient` enum (`byte`)
+
+`CodeServicesClient` is used for **server-to-client** progress packets. These are sent by the worker during long-running operations (downloads, installs) to update a progress bar on the client side.
+
+```csharp
+public enum CodeServicesClient : byte
+{
+    SetMaxProgress = 10,
+    SetBarProgress = 11,
+}
+```
+
+| Value | Name | Description |
+|-------|------|-------------|
+| `10` | `SetMaxProgress` | Sets the maximum value of the progress bar (the "total" steps). |
+| `11` | `SetBarProgress` | Updates the current progress bar value. |
+
+---
+
+## `CodeTerbinProtocol` enum (`byte`)
+
+`CodeTerbinProtocol` occupies the **reserved range 0–9** and is used exclusively for internal protocol-level messaging. Application-level handlers must not use these values as their action byte.
+
+```csharp
+public enum CodeTerbinProtocol : byte
+{
+    Stop           = 0,
+    Response       = 1,
+    Load           = 2,
+    Prolong        = 3,
+    Solicit        = 4,
+    ExceptionAlert = 5,
+
+    [Obsolete] Create  = 6,
+    [Obsolete] Read    = 7,
+    [Obsolete] Update  = 8,
+    [Obsolete] Deleted = 9,
+}
+```
+
+| Value | Name | Description |
+|-------|------|-------------|
+| `0` | `Stop` | Signals that communication should stop. |
+| `1` | `Response` | Marks a packet as a response to a prior request (default `ActionMethod` in `InfoResponse`). |
+| `2` | `Load` | Used to load or initialise a connection context. |
+| `3` | `Prolong` | Extends the lifetime of an active session or keep-alive. |
+| `4` | `Solicit` | Solicits memory or a resource from the worker. |
+| `5` | `ExceptionAlert` | Broadcasts an exception alert over the protocol channel. |
+| `6` | `Create` ⚠️ | **Obsolete** — use `TerbinCRUD` instead. |
+| `7` | `Read` ⚠️ | **Obsolete** — use `TerbinCRUD` instead. |
+| `8` | `Update` ⚠️ | **Obsolete** — use `TerbinCRUD` instead. |
+| `9` | `Deleted` ⚠️ | **Obsolete** — use `TerbinCRUD` instead. |
+
+<Warning>
+  `Create`, `Read`, `Update`, and `Deleted` inside `CodeTerbinProtocol` are marked `[Obsolete(error: true)]` — they will cause a **compile-time error** if referenced. Use `TerbinCRUD` (or the aliased values in `CodeServices`) for all CRUD operations.
+</Warning>
+
+---
+
+## `InternalErrors` enum (`ushort`)
+
+`InternalErrors` is the typed error code sent inside an `InfoResponse.CreateInteralError` payload. When a handler cannot complete its work it serialises one of these values into the response payload so the client can identify the exact failure without parsing a string message.
+
+```csharp
+// Worker side — sending an internal error
+return InfoResponse.CreateInteralError(request.IdRequest,
+    BitConverter.GetBytes((ushort)InternalErrors.PluginNotExist));
+
+// Client side — reading an internal error
+ushort code = BitConverter.ToUInt16(response.Payload);
+InternalErrors error = (InternalErrors)code;
+if (error == InternalErrors.PluginNotExist)
+    Console.WriteLine("Plugin does not exist on disk.");
+```
+
+### General (0–99)
+
+| Value | Name | Description |
+|-------|------|-------------|
+| `11` | `IdSoliciteError` | The solicitation ID is invalid or could not be resolved. |
+| `12` | `TODO_WIP` | Placeholder — feature not yet implemented. |
+| `97` | `IsUnknown` | Unknown error with no more specific code available. |
+| `98` | `IsSucces` | Sentinel "success" value used in error-code return paths. |
+| `99` | `IsCancelled` | The operation was cancelled. |
+
+### Game (100–199)
+
+| Value | Name | Description |
+|-------|------|-------------|
+| `101` | `GameRuteNotExist` | The configured game path/route does not exist on disk. |
+| `102` | `GameAlredyExist` | Attempted to register a game that is already registered. |
+| `103` | `GameNotContainExes` | The game directory contains no executable files. |
+| `104` | `GameNotLaunch` | The game process failed to launch. |
+
+### Plugin (200–299)
+
+| Value | Name | Description |
+|-------|------|-------------|
+| `201` | `PluginNotConect` | Could not connect to the plugin source or registry. |
+| `202` | `PluginOnDowload` | An error occurred during the plugin download. |
+| `203` | `PluginNotSuchSpace` | Insufficient disk space to store the plugin. |
+| `204` | `PluginInvalidURL` | The plugin download URL is malformed or unreachable. |
+| `205` | `PluginNotExist` | The requested plugin does not exist. |
+| `206` | `PluginGet` | Failed to retrieve the plugin record. |
+| `207` | `PluginGetPath` | Failed to resolve the plugin's file system path. |
+| `208` | `PluginOnSave` | An error occurred while saving the plugin data. |
+| `209` | `PluginGetManifest` | Failed to read or parse the plugin manifest. |
+| `210` | `PluginOnUnistall` | An error occurred during plugin uninstall. |
+| `211` | `PluginOnRemove` | An error occurred while removing plugin files. |
+
+### Instances (300–399)
+
+| Value | Name | Description |
+|-------|------|-------------|
+| `301` | `InstanceGetSizeError` | Could not calculate the size of the instance. |
+| `302` | `InstanceNotExist` | The requested instance does not exist. |
+| `303` | `InstanceIsNotInstance` | The target path or object is not a valid Terbin instance. |
+| `304` | `InstanceRegister` | Failed to register the instance. |
+| `305` | `InstanceUnregister` | Failed to unregister the instance. |
+| `306` | `InstanceCreate` | Failed to create a new instance. |
+| `307` | `InstanceGet` | Failed to retrieve the instance record. |
+
+### Rute (500–599)
+
+| Value | Name | Description |
+|-------|------|-------------|
+| `501` | `RuteSerializeError` | Failed to serialize or deserialize a route entry. |
+| `502` | `RuteAccesNullOrNotExist` | The route record is null or does not exist. |
+
+### BepInEx (600–699)
+
+| Value | Name | Description |
+|-------|------|-------------|
+| `601` | `BepInExNotConect` | Could not connect to the BepInEx component or pipe. |
+| `602` | `BepInExNotInstall` | BepInEx is not installed in the expected location. |
+
+### Node (700–799)
+
+| Value | Name | Description |
+|-------|------|-------------|
+| `701` | `NodeDinamite` | A critical node-level failure occurred (explosive failure sentinel). |
+
+### Handwritten (800–899)
+
+| Value | Name | Description |
+|-------|------|-------------|
+| `801` | `HandwrittenCreate` | Failed to create a handwritten (manual) directory entry. |
+| `802` | `HandwrittenRemove` | Failed to remove a handwritten directory entry. |
+| `803` | `HandwrittenGet` | Failed to retrieve a handwritten directory entry. |
+
+### Manifest (900–999)
+
+| Value | Name | Description |
+|-------|------|-------------|
+| `901` | `ManifestCreate` | Failed to create a manifest file. |
+| `902` | `ManifestRemove` | Failed to remove a manifest file. |
+| `903` | `ManifestGet` | Failed to read or parse a manifest file. |
+| `904` | `ManifestUpdate` | Failed to write an updated manifest file. |
+
+### Zip (1000–1099)
+
+| Value | Name | Description |
+|-------|------|-------------|
+| `1001` | `ZipExtractError` | A non-exception extraction failure occurred. |
+| `1002` | `ZipExtractException` | An exception was thrown during zip extraction. |
+| `1003` | `ZipDeletedTempException` | An exception occurred while deleting the temporary zip file. |
+
+---
+
+## Putting it all together
+
+```csharp
+// Build a "Read Plugin" action key
+var action = new IdArray(
+    (byte)CodeServices.Read,           // 253
+    (byte)CodeServicesSection.Plugin   // 20
+);
+
+// Dispatch the packet
+PacketRequest packet = PacketRequest.Create(action, payload);
+InfoResponse response = await communicator.Communicate(action, payload);
+
+// Check for an internal error
+if (response.Status == CodeStatus.InternalWorkerError && response.Payload.Length >= 2)
+{
+    var errorCode = (InternalErrors)BitConverter.ToUInt16(response.Payload);
+    Console.WriteLine($"Handler reported: {errorCode}"); // e.g. PluginNotExist
+}
+```

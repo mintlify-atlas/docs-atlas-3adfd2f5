@@ -1,0 +1,265 @@
+---
+title: "Terbin Architecture: Projects, Layers, and Data Flow"
+sidebarTitle: "Architecture"
+description: "How TerbinLibrary, TerbinService, and SimulateClient fit together, and how a packet travels from client send to server handler and back."
+---
+
+Terbin is a three-project C# solution (`TerbinProyect.sln`). Each project has a single, well-scoped responsibility: `TerbinLibrary` supplies all reusable infrastructure, `TerbinService` uses that infrastructure to run a long-lived mod-management daemon, and `SimulateClient` exercises the service interactively during development. Understanding where each piece lives — and why — makes it straightforward to extend the system with new commands, new managers, or new clients.
+
+---
+
+## Project Breakdown
+
+### TerbinLibrary
+
+TerbinLibrary is the core SDK and the only project that the other two reference. It is organized into the following namespaces:
+
+- **`TerbinLibrary.Communication`** — `TerbinCommunicator`, the top-level class every consumer instantiates. It owns the `NamedPipeServerStream` or `NamedPipeClientStream`, a `ConcurrentQueue<PacketRequest>` send queue, a `SemaphoreSlim` send signal, and a `ConcurrentDictionary` of pending `TaskCompletionSource<PacketRequest>` entries for in-flight `Communicate()` calls. Background tasks for sending and receiving run continuously after `Connect()` or after the first client connects.
+
+- **`TerbinLibrary.Communication.Packets`** — The wire types:
+  - `Header` — An unmanaged `[StructLayout(LayoutKind.Sequential, Pack = 1)]` struct carrying `IdRequest` (`ushort`), `OrderRequest` (`ushort`), `Status` (`CodeStatus`), and `IdMemory` (`byte`).
+  - `PacketRequest` — The full packet: a `Header`, an `IdArray` action key, and a `byte[]` payload. Implements `IStructSerializable` for zero-copy binary serialization over the pipe.
+  - `IdArray` — A variable-length byte array that identifies the command to dispatch. Implements `IEquatable<IEnumerable<byte>>` and provides content-based `GetHashCode` so it works correctly as a `ConcurrentDictionary` key.
+  - `InfoResponse` — A lightweight response struct with `IdRequest`, `Status`, `ActionMethod`, and `Payload`. Use the static factory methods (`CreateSucces`, `Create`, `CreateInteralError`, `CreateCancelled`) to build responses in handlers.
+
+- **`TerbinLibrary.Protocol`** — `TerbinProtocol` (protocol constants), `CodeStatus` (HTTP-inspired status codes, e.g. `Succes = 200`, `Execute = 300`, `ActionNotFound = 440`), `CodeTerbinProtocol` (built-in action bytes 0–9: `Stop`, `Response`, `Load`, `Prolong`, `Solicit`, `ExceptionAlert`), and `CodeTerbinMemory`.
+
+- **`TerbinLibrary.Execution`** — The reflection-based dispatch pipeline:
+  - `TerbinExecutableAttribute` — Marks a handler method with one or more action bytes.
+  - `TerbinExecutableHelper` — Validates method signatures (`Header`, `byte[]`, `CancellationToken` → `Task<InfoResponse?>`) and performs the assembly scan.
+  - `ExecutableDispatcher` — Thread-safe dispatcher backed by a `ConcurrentDictionary<IEquatable<IEnumerable<byte>>, List<TerbinExecutableDelegate>>`.
+  - `TerbinExecutableManager` — Static façade over `ExecutableDispatcher` providing `Register`, `Unregister`, `DispatchAsync`, and `RegisterFromAssembly`.
+  - `TerbinExecutor` — Bootstrapper that calls `RegisterInternal()` (registering the library's own built-in handlers: `Load`, `Solicit`, `Prolong`, `Response`) and exposes `Register(Assembly)` for application-level handlers.
+
+- **`TerbinLibrary.Memory`** — `TerbinMemoryManager` manages numbered in-memory slots used for large-payload fragmentation. The communicator stores fragments in these slots by slot ID until the final fragment arrives, then reassembles the full payload before handing it to `OnRecive`.
+
+- **`TerbinLibrary`** (root) — `CodeServices`, `CodeServicesSection`, `CodeStatus`, `InternalErrors`, and `TerbinErrorCode` enumerations that define the vocabulary for service/section routing and error reporting.
+
+---
+
+### TerbinService
+
+TerbinService is the background daemon. It is a .NET Generic Host application with a single hosted service, `Worker`, that creates the named-pipe server and owns the application lifetime. Internally it is divided into three layers:
+
+**Managers** own all business logic and mutable state. Each manager is a static class responsible for one domain:
+
+| Manager | Responsibility |
+|---|---|
+| `ManagerPlugin` | Download, install, uninstall, and query BepInEx plugins |
+| `ManagerInstances` | Create, register, duplicate, and remove Farlands mod instances |
+| `ManagerGames` | Track Farlands game installations and launch the game |
+| `ManagerConfiguration` | Read and write `config.json` (game path, instance path, plugin storage path) |
+| `ManagerIndex` | Maintain the manifest index across all registered instances |
+| `ManegerStoragePlugin` | Manage the centralized plugin storage directory |
+| `ManagerInjectors` | Handle BepInEx injector installation and state |
+| `ManagerNode` | Manage node-based dependency trees |
+
+**Services** are thin IPC dispatch handlers. Each service class contains `[TerbinExecutable]`-decorated static methods whose entire purpose is to deserialize `pParameters`, call the corresponding manager, and return an `InfoResponse`. No business logic lives inside a service:
+
+| Service | Delegates to |
+|---|---|
+| `ServicePlugins` | `ManagerPlugin` |
+| `ServiceInstances` | `ManagerInstances` |
+| `ServiceGames` | `ManagerGames` |
+| `ServiceConfiguration` | `ManagerConfiguration` |
+| `ServicePluginStorage` | `ManegerStoragePlugin` |
+
+**Valve helpers** provide Steam and Proton integration:
+
+| Helper | Responsibility |
+|---|---|
+| `ManagerSteam` / `SteamLocator` | Locate Steam installations and library paths |
+| `ManagerProton` | Detect and configure Proton compatibility layers |
+| `ManagerFarlands` | Launch the Farlands executable (wraps Steam/Proton paths) |
+
+Configuration is read from `TerbinService/config/config.json`:
+
+```json
+{
+  "rute_farlands": "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Farlands",
+  "rute_instances": "C:\\Users\\PC\\Documents\\TerbinInstances",
+  "rute_plugins": "C:\\Users\\PC\\Documents\\TerbinStorage"
+}
+```
+
+File-system constants (manifest file names, BepInEx plugin paths) live in `TerbinServiceConst`:
+
+```csharp
+// TerbinService/TerbinServiceConst.cs
+public const string MANIFEST_INSTANCE        = "_Manifest.json";
+public const string MANIFEST_STORAGE         = "_ManifestStorage.json";
+public const string HANDWRITTEN              = "_Handwritten.json";
+public const string FOLDER_INFORMATION_INSTANCE = ".TerbinInstaceInformation";
+public const string PATH_BEPINEX_PLUGIN      = "/BepInEx/Plugin";
+```
+
+---
+
+### SimulateClient
+
+SimulateClient is a development console application. It connects to the running service over the same `TerbinPipe`, registers its own `[TerbinExecutable]` handlers (so the server can push packets back to it), and presents an interactive loop that parses `"ClassName -MethodName"` commands and invokes the matching static method via reflection. It is the fastest way to exercise a new service method end-to-end without writing a dedicated test harness.
+
+---
+
+## Data Flow
+
+The following walk-through traces a single `Communicate()` call from client to server and back.
+
+<Steps>
+
+### Client builds and sends the packet
+
+The caller constructs an `IdArray` action key and a `byte[]` payload, then calls `Communicate()`:
+
+```csharp
+var action = new IdArray((byte)CodeServices.Execute, (byte)CodeServicesSection.Plugin);
+PacketRequest response = await communicator.Communicate(action, payloadBytes);
+```
+
+`Communicate()` auto-generates a `ushort` request ID via `MiniID.NewS`, registers a `TaskCompletionSource<PacketRequest>` in `_pendingRequests`, and calls the internal `send()` method.
+
+### TerbinCommunicator checks payload size and enqueues
+
+Inside `send()`, the payload length is compared to `TerbinProtocol.MAX_PLD` (`0xFFF0` = 65,520 bytes):
+
+- **Fits in one packet** → `HandleSendSingle` enqueues a `PacketRequest` with `OrderRequest = TerbinProtocol.ORDER_SINGLE` (0).
+- **Too large** → `HandleSendFragment` first sends a `CheckExecution` probe, then requests a memory slot from the server via `SoliciteRequestMemory()`, uploads the fragments one by one with `Load()`, and finally enqueues the last fragment with `OrderRequest = TerbinProtocol.FINAL_PACKET` (`ushort.MaxValue`).
+
+```csharp
+// TerbinLibrary/Communication/TerbinCommunicator.cs
+private async Task<PacketRequest?> send(
+    IdArray pActionMethod, byte[] pPayload, CodeStatus pStatus, ushort pId)
+{
+    PacketRequest? error = null;
+    if (pPayload.Length <= TerbinProtocol.MAX_PLD)
+        _ = HandleSendSigle(pActionMethod, pPayload, pId, pStatus);
+    else
+        error = await HandleSendFragment(pActionMethod, pPayload, pId, pStatus);
+    return error; // Returns null if everything is correct.
+}
+```
+
+### The send loop dequeues and writes to the pipe
+
+The background `manageSend` task waits on `_signal`, dequeues the next `PacketRequest`, and writes it to the pipe via `StreamWriteStruct.WriteAsycn<PacketRequest>()`. The `PacketRequest.WriteTo(Span<byte>)` method serializes the `Header`, `IdArray`, and payload into a contiguous byte buffer.
+
+### The server's receive loop reads and reconstructs
+
+The server's background `manageReceive` task reads bytes from its end of the pipe via `StreamReadStruct.ReadAsycn<PacketRequest>()`. The deserialized `PacketRequest` is passed to `handleReceive()`, which calls `TerbinMemoryHelper.TryGetMemoryStream()`. If the packet has a non-zero `IdMemory` field, the helper looks up the matching `TerbinMemory` slot, retrieves all stored fragments in order, and returns the reassembled payload. Single-packet messages pass through unchanged.
+
+### `OnRecive` fires with the reassembled packet
+
+After payload reassembly, `handleReceive` invokes the `OnRecive` event delegate:
+
+```csharp
+// TerbinService/Worker.cs
+communicator.OnRecive += async (pCapsule) =>
+{
+    CurrentContext.Value = new InfoLocalThreads { Communicator = communicator };
+    return await TerbinExecutableManager.DispatchAsync(
+        pCapsule.Head, pCapsule.Payload, pCapsule.ActionMethod);
+};
+```
+
+### `TerbinExecutableManager.DispatchAsync` routes to the handler
+
+`DispatchAsync` looks up `pCapsule.ActionMethod` in the dispatcher's `ConcurrentDictionary`. If found, it checks `pHead.Status`:
+
+- `Execute` (300) — normal execution path.
+- `CheckExecution` (303) — returns `InfoResponse.CreateSucces(pHead.IdRequest)` immediately without running any handler logic. Used to verify a handler exists before sending a large fragmented payload.
+- `CancelByAction` (305) — cancels the `CancellationTokenSource` associated with the action.
+- `ActionNotFound` — returns `InfoResponse.Create(pHead.IdRequest, CodeStatus.ActionNotFound)`.
+
+For normal execution, `TerbinExecutableHelper.ExecutionList` runs all registered handlers for that action concurrently and returns the first non-null `InfoResponse?`.
+
+### The handler returns `InfoResponse?`; the communicator sends it back
+
+The `[TerbinExecutable]`-decorated method returns an `InfoResponse?`. If non-null, `handleReceive` calls `communicator.Reply(rCap.Value)`, which routes through `send()` with `ActionMethod = CodeTerbinProtocol.Response` (byte `1`). The response packet travels back over the pipe to the client.
+
+### The client's pending `TaskCompletionSource` resolves
+
+On the client side, `manageReceive` reads the response packet. Because its `ActionMethod` is `CodeTerbinProtocol.Response`, the built-in `TerbinExecutor.Response` handler is invoked:
+
+```csharp
+// TerbinLibrary/Execution/TerbinExecutor.cs
+[TerbinExecutable((byte)CodeTerbinProtocol.Response)]
+public static async Task<InfoResponse?> Response(
+    Header pHead, byte[] pParameters, CancellationToken pToken)
+{
+    if (pToken.IsCancellationRequested) return null;
+    _communicator?.GiveResponse(
+        new PacketRequest(pHead, new IdArray((byte)CodeTerbinProtocol.Response), pParameters));
+    return null;
+}
+```
+
+`GiveResponse` calls `TrySetResult` on the `TaskCompletionSource<PacketRequest>` stored in `_pendingRequests`, unblocking the `await communicator.Communicate(...)` call on the caller's side with the fully populated `PacketRequest`.
+
+</Steps>
+
+---
+
+## Directory Structure
+
+```text
+TerbinProyect/
+├── TerbinProyect.sln
+│
+├── TerbinLibrary/                         # Core SDK
+│   ├── Communication/
+│   │   ├── TerbinCommunicator.cs          # Named-pipe IPC engine
+│   │   └── Packets/
+│   │       ├── Header.cs                  # Fixed-size packet header (unmanaged)
+│   │       ├── PacketRequest.cs           # Full packet (Header + IdArray + payload)
+│   │       ├── IdArray.cs                 # Variable-length action key
+│   │       └── InfoResponse.cs            # Response struct with factory helpers
+│   ├── Execution/
+│   │   ├── TerbinExecutableAttribute.cs   # [TerbinExecutable] attribute
+│   │   ├── TerbinExecutableManager.cs     # Static dispatcher façade
+│   │   ├── TerbinExecutableHelper.cs      # Assembly scan + signature validation
+│   │   └── TerbinExecutor.cs              # Bootstrap + built-in handlers
+│   ├── Memory/
+│   │   └── TerbinMemoryManager.cs         # Fragmentation slot store
+│   ├── Protocol/
+│   │   └── TerbinProtocol.cs              # Constants + CodeStatus + CodeTerbinProtocol
+│   ├── CodeServices.cs                    # Service/section routing enums
+│   └── Useful/
+│       └── PluginUtil.cs                  # Version-string extraction helper
+│
+├── TerbinService/                         # Background service daemon
+│   ├── Program.cs                         # Generic Host entry point
+│   ├── Worker.cs                          # BackgroundService + Stop handler
+│   ├── TerbinServiceConst.cs              # File-system constant strings
+│   ├── config/
+│   │   └── config.json                    # Farlands/instance/plugin paths
+│   ├── Managers/
+│   │   ├── ManagerPlugin.cs
+│   │   ├── ManagerInstances.cs
+│   │   ├── ManagerGames.cs
+│   │   ├── ManagerConfiguration.cs
+│   │   ├── ManagerIndex.cs
+│   │   ├── ManegerStoragePlugin.cs
+│   │   ├── ManagerInjectors.cs
+│   │   └── ManagerNode.cs
+│   ├── Services/
+│   │   ├── ServicePlugins.cs
+│   │   ├── ServiceInstances.cs
+│   │   ├── ServiceGames.cs
+│   │   ├── ServiceConfiguration.cs
+│   │   └── ServicePluginStorage.cs
+│   └── Valve/
+│       ├── ManagerFarlands.cs
+│       ├── ManagerSteam.cs
+│       ├── ManagerProton.cs
+│       └── SteamLocator.cs
+│
+└── SimulateClient/                        # Interactive development client
+    ├── Program.cs                         # Pipe connect + command loop
+    └── Game.cs                            # Sample command class
+```
+
+---
+
+<Note>
+  **The manager/service split is intentional and important.** Managers own the business logic and all mutable state — they are the authoritative source of truth for plugins, instances, game paths, and configuration. Services are pure IPC dispatch glue: they receive a `byte[]` payload, deserialize it, call the right manager method, and return an `InfoResponse`. This separation means you can unit-test a manager without spinning up a pipe, and you can swap out the serialization format inside a service without touching any domain logic. When adding a new feature, always ask: does this logic belong in the manager (business rules, state) or in the service (IPC translation)?
+</Note>

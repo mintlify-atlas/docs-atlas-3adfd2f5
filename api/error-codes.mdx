@@ -1,0 +1,451 @@
+---
+title: "Error Code Enums: TerbinErrorCode, AppError, ErrorFlags"
+sidebarTitle: "Error Codes"
+description: "Reference for Terbin's typed error code enums — TerbinErrorCode, AppError, ErrorFlags, and ExceptionFlags — used for structured error handling across the framework."
+---
+
+Terbin defines multiple complementary error-code enums, each targeting a different layer of the stack. `TerbinErrorCode` is the low-level protocol enum serialised over the wire as a `ushort`. `AppError` covers higher-level business-logic failures as a `long`. `ErrorFlags` and `ExceptionFlags` are bitflag enums that let you combine multiple simultaneous error conditions into a single value for rich diagnostics. Together they provide a fully typed, code-based error system without relying on string parsing or exception message inspection.
+
+---
+
+## `TerbinErrorCode` enum (`ushort`)
+
+`TerbinErrorCode` is the primary low-level error code type. It costs only 2 bytes on the wire. A value of `0` (`None`) always means success; every other value indicates a failure in one of the categories below.
+
+```csharp
+public enum TerbinErrorCode : ushort
+{
+    None = 0, // All good (Success)
+    ...
+}
+```
+
+### Range overview
+
+| Range | Category | Representative values |
+|-------|----------|----------------------|
+| `1000–1999` | Validation | `ParameterNull`, `FormatInvalid`, `ValueOutOfRange` |
+| `2000–2999` | Protocol | `PacketMalformed`, `PayloadTooLarge`, `FragmentationError` |
+| `3000–3999` | Memory | `MemoryIdNotFound`, `BufferOverflow`, `StreamReadError` |
+| `4000–4999` | Execution | `ActionNotFound`, `HandlerExecutionFailed`, `InvalidSignature` |
+| `5000–5999` | Business logic | `ResourceNotFound`, `InvalidStateTransition`, `OperationCancelled` |
+| `6000–6999` | Security | `Unauthorized`, `ForbiddenAccess`, `SignatureInvalid` |
+| `7000–7999` | Connectivity | `TimeoutExceeded`, `ConnectionLost`, `EndpointUnreachable` |
+| `9000–9999` | Fatal | `InternalSystemError`, `OutOfMemory`, `NotImplementedYet` |
+
+---
+
+### 1000–1999: Validation
+
+Errors in this range indicate that input data did not pass basic validation before any protocol or business logic was attempted.
+
+| Value | Name | Description |
+|-------|------|-------------|
+| `1001` | `ParameterNull` | A required parameter was `null`. |
+| `1002` | `ParameterEmpty` | A required parameter was empty (string or collection). |
+| `1003` | `FormatInvalid` | The value does not match the expected format. |
+| `1004` | `ValueOutOfRange` | The value falls outside the permitted range. |
+| `1005` | `LengthExceeded` | The input is longer than the maximum allowed length. |
+| `1006` | `MissingRequiredData` | A required field or piece of data was not provided. |
+| `1007` | `InvalidCast` | The value could not be cast to the expected type. |
+| `1008` | `DataTypeMismatch` | The `CodeTypeData` encoding does not match the actual payload type. |
+| `1009` | `InvalidLength` | The length field contains an invalid value. |
+
+### 2000–2999: Protocol
+
+Errors in this range arise from malformed or out-of-order packets during the Terbin packet exchange.
+
+| Value | Name | Description |
+|-------|------|-------------|
+| `2001` | `PacketMalformed` | The packet structure is corrupt or cannot be parsed. |
+| `2002` | `HeaderInvalid` | The packet header contains invalid values. |
+| `2003` | `PayloadTooLarge` | The payload exceeds `MAX_PLD` (`0xFFF0`). |
+| `2004` | `FragmentationError` | An error occurred while processing a fragmented (`FRAGMENT_IN`) packet. |
+| `2005` | `PacketOrderMismatch` | A packet arrived out of the expected sequence order. |
+| `2006` | `FinalPacketMissing` | The final fragment (`FINAL_PACKET = 0xFFFF`) was never received. |
+| `2007` | `ChecksumInvalid` | The packet checksum does not match its contents. |
+| `2008` | `ProtocolVersionUnknown` | The protocol version in the header is not recognised. |
+| `2009` | `AlreadyExists` | A packet or petition with this ID already exists in-flight. |
+| `2010` | `OverMaximusPacket` | The packet count exceeded the protocol maximum. |
+
+### 3000–3999: Memory
+
+Errors in this range originate from the memory-management layer (`TerbinMemory`, streams, and buffer operations).
+
+| Value | Name | Description |
+|-------|------|-------------|
+| `3001` | `MemoryIdNotFound` | `TryGetResult()` failed — the memory slot ID does not exist. |
+| `3002` | `MemoryReleaseFailed` | The memory slot could not be released after use. |
+| `3003` | `MemoryStoreFailed` | Storing data into the memory slot failed. |
+| `3004` | `MemoryAlreadyAllocated` | The slot is already allocated; cannot allocate again. |
+| `3005` | `BufferOverflow` | A write operation would overflow the buffer. |
+| `3006` | `StreamReadError` | Failed to read bytes from a stream. |
+| `3007` | `StreamWriteError` | Failed to write bytes to a stream. |
+| `3008` | `ReservedMemoryAccess` | Attempted to use a slot in the reserved memory range (`RESERVE_MEMORY = 9`). |
+| `3009` | `OrderMismatch` | Fragments arrived in the wrong order during stream reassembly. |
+
+### 4000–4999: Execution
+
+Errors in this range come from the `ExecutableDispatcher` and action-registration subsystem.
+
+| Value | Name | Description |
+|-------|------|-------------|
+| `4001` | `ActionNotFound` | No handler is registered for the incoming action key. |
+| `4002` | `ActionAlreadyRegistered` | Attempted to register a handler for an action that already has one. |
+| `4003` | `ActionRegistrationFailed` | The registration process itself failed (e.g. reflection error). |
+| `4004` | `HandlerExecutionFailed` | An exception was caught inside `DispatchAsync`. |
+| `4005` | `InvalidSignature` | The handler method signature does not match the required delegate type. |
+
+### 5000–5999: Business Logic
+
+Domain-level errors that indicate a valid request could not be fulfilled due to state or resource constraints.
+
+| Value | Name | Description |
+|-------|------|-------------|
+| `5001` | `ResourceNotFound` | The requested business resource does not exist. |
+| `5002` | `ResourceAlreadyExists` | Cannot create a resource that already exists. |
+| `5003` | `InvalidStateTransition` | The operation is not permitted in the current state. |
+| `5004` | `OperationCancelled` | The operation was cancelled before completion. |
+| `5005` | `LimitExceeded` | A quota or business-level limit was exceeded. |
+
+### 6000–6999: Security
+
+| Value | Name | Description |
+|-------|------|-------------|
+| `6001` | `Unauthorized` | The caller is not authenticated. |
+| `6002` | `ForbiddenAccess` | The caller is authenticated but lacks permission for this action. |
+| `6003` | `SignatureInvalid` | The cryptographic or HMAC signature on the request is invalid. |
+
+### 7000–7999: Connectivity
+
+| Value | Name | Description |
+|-------|------|-------------|
+| `7001` | `TimeoutExceeded` | The operation exceeded `MAXIMUS_RESPONSE_TIME` (8 seconds). |
+| `7002` | `ConnectionLost` | The named-pipe or socket connection dropped unexpectedly. |
+| `7003` | `EndpointUnreachable` | The target endpoint could not be reached. |
+
+### 9000–9999: Fatal
+
+Fatal errors mean the worker cannot continue safely. These should be surfaced as critical alerts.
+
+| Value | Name | Description |
+|-------|------|-------------|
+| `9000` | `InternalSystemError` | An unexpected, unrecoverable system-level error occurred. |
+| `9001` | `OutOfMemory` | The process ran out of managed or unmanaged memory. |
+| `9999` | `NotImplementedYet` | The code path has not been implemented yet. |
+
+---
+
+## `AppError` enum (`long`)
+
+`AppError` targets higher-level, human-readable business-logic errors. It is a `long`, making it suitable for in-process error propagation without the two-byte wire constraint of `TerbinErrorCode`. `None = 0` means success.
+
+### Range summary
+
+| Range | Category |
+|-------|----------|
+| `100–199` | Validation — parameter and data quality checks |
+| `200–299` | Collections — lookup and list operations |
+| `300–399` | State & business logic — operation legality |
+| `400–499` | Security & permissions |
+| `500–599` | Infrastructure — I/O, network, and concurrency |
+| `900–999` | Critical / uncontrolled errors |
+
+### Commonly referenced values
+
+| Value | Name | Description |
+|-------|------|-------------|
+| `100` | `NullValue` | A `null` was passed where a value was required. |
+| `101` | `EmptyValue` | An empty string or collection was passed. |
+| `102` | `WhitespaceOnly` | A string contained only whitespace. |
+| `103` | `ValueTooLow` | Value is below the minimum (e.g. a negative where positive was required). |
+| `104` | `ValueTooHigh` | Value exceeds the maximum. |
+| `105` | `LengthTooShort` | String or collection is shorter than required. |
+| `106` | `LengthTooLong` | String or collection exceeds the maximum length. |
+| `107` | `InvalidFormat` | Value doesn't match the required format (e.g. regex, email). |
+| `108` | `InvalidType` | The data type is not what was expected. |
+| `200` | `ItemNotFound` | Item is absent from a dictionary or list. |
+| `201` | `ItemAlreadyExists` | Attempted to add a duplicate ID. |
+| `202` | `CollectionEmpty` | The list or collection has no elements to process. |
+| `203` | `IndexOutOfRange` | Array index is outside valid bounds. |
+| `300` | `InvalidState` | The operation is not valid in the current state. |
+| `301` | `NotAllowed` | The operation is not permitted in this context. |
+| `302` | `DependencyMissing` | A required dependency or precondition is absent. |
+| `303` | `LimitExceeded` | A logical quota was exceeded. |
+| `304` | `Expired` | A token, session, or datum has expired. |
+| `400` | `Unauthorized` | Caller is not authenticated. |
+| `401` | `Forbidden` | Caller is authenticated but not permitted. |
+| `402` | `InvalidCredentials` | Wrong username or password. |
+| `500` | `Timeout` | The operation took too long. |
+| `501` | `ConnectionFailed` | Named-pipe, socket, or other connection failure. |
+| `502` | `ResourceLocked` | A file or memory resource is locked by another thread. |
+| `503` | `ReadError` | Failed to read from disk or stream. |
+| `504` | `WriteError` | Failed to write to disk or stream. |
+| `900` | `NotImplemented` | The function has not been programmed yet. |
+| `999` | `InternalError` | Generic unexpected error ("something weird happened"). |
+
+---
+
+## `ErrorFlags` enum (`ulong`) and `ExceptionFlags` enum (`ulong`)
+
+Both `ErrorFlags` and `ExceptionFlags` are `[Flags]` bitflag enums backed by `ulong` (64 bits), allowing any combination of error conditions to be expressed as a single value. They are intended as a rich diagnostic and future-extension mechanism.
+
+<Note>
+  `ErrorFlags` and `ExceptionFlags` are provided as a design reference and future extension mechanism. They are not yet heavily used in the current Terbin codebase, but you can use them today for rich in-process error aggregation or logging.
+</Note>
+
+<Accordion title="ErrorFlags — all bit values">
+
+`ErrorFlags` organises its 64 bits into eight categories. You can OR multiple flags together to express combined failure conditions.
+
+```csharp
+[Flags]
+public enum ErrorFlags : ulong { ... }
+```
+
+**Validation (bits 0–6)**
+
+| Bit | Name | Description |
+|-----|------|-------------|
+| 0 | `NullParameter` | A required parameter was null. |
+| 1 | `EmptyString` | A required string was empty. |
+| 2 | `FormatInvalid` | Value format is wrong. |
+| 3 | `ValueOutOfRange` | Value is outside the permitted range. |
+| 4 | `InvalidLength` | Length field is invalid. |
+| 5 | `MissingRequiredData` | Required data was absent. |
+| 6 | `InvalidCast` | A type cast failed. |
+
+**Protocol & Packets (bits 8–14)**
+
+| Bit | Name | Description |
+|-----|------|-------------|
+| 8 | `PacketMalformed` | Packet structure is corrupt. |
+| 9 | `HeaderInvalid` | Header contains invalid values. |
+| 10 | `PayloadTooLarge` | Payload exceeds `MAX_PLD`. |
+| 11 | `FragmentationError` | Fragment reassembly failed. |
+| 12 | `OrderMismatch` | Unexpected packet sequence order. |
+| 13 | `ChecksumMismatch` | Checksum does not match. |
+| 14 | `UnknownProtocolType` | Unrecognised protocol type byte. |
+
+**Memory & Streams (bits 16–22)**
+
+| Bit | Name | Description |
+|-----|------|-------------|
+| 16 | `MemoryNotAllocated` | Memory slot was never allocated. |
+| 17 | `MemoryIdNotFound` | `Release()` or `TryGetResult()` failed to find the slot. |
+| 18 | `BufferOverflow` | Write would overflow the buffer. |
+| 19 | `StreamReadError` | Read from stream failed. |
+| 20 | `StreamWriteError` | Write to stream failed. |
+| 21 | `EndOfStreamReached` | Unexpected end of stream. |
+| 22 | `MemoryCorrupted` | Memory contents are corrupt. |
+
+**Execution & Dispatching (bits 24–28)**
+
+| Bit | Name | Description |
+|-----|------|-------------|
+| 24 | `ActionNotFound` | No handler registered for action key. |
+| 25 | `HandlerNotSet` | Handler delegate is null. |
+| 26 | `MethodMismatch` | Handler method signature doesn't match. |
+| 27 | `ExecutionFault` | Generic catch in `DispatchAsync` triggered. |
+| 28 | `ActionAlreadyExists` | Duplicate action registration attempted. |
+
+**State & Business Logic (bits 32–38)**
+
+| Bit | Name | Description |
+|-----|------|-------------|
+| 32 | `NotFound` | Resource not found. |
+| 33 | `AlreadyExists` | Resource already exists. |
+| 34 | `InvalidState` | Invalid state transition. |
+| 35 | `LimitExceeded` | Quota or business limit exceeded. |
+| 36 | `DuplicateRequest` | Duplicate in-flight request. |
+| 37 | `NotImplementedYet` | Feature not yet implemented. |
+| 38 | `OperationRejected` | Operation explicitly rejected. |
+
+**Security (bits 42–45)**
+
+| Bit | Name | Description |
+|-----|------|-------------|
+| 42 | `Unauthorized` | Not authenticated. |
+| 43 | `Forbidden` | Authenticated but not permitted. |
+| 44 | `TokenExpired` | Authentication token has expired. |
+| 45 | `SignatureInvalid` | Cryptographic signature is invalid. |
+
+**Connectivity & Concurrency (bits 48–53)**
+
+| Bit | Name | Description |
+|-----|------|-------------|
+| 48 | `Timeout` | Exceeded `MAXIMUS_RESPONSE_TIME`. |
+| 49 | `ResourceLocked` | File or memory is locked by another thread. |
+| 50 | `NetworkUnavailable` | Network is not available. |
+| 51 | `ConnectionLost` | Connection dropped unexpectedly. |
+| 52 | `UserCancelled` | User explicitly cancelled the operation. |
+| 53 | `RateLimited` | Request was rate-limited. |
+
+**Critical Infrastructure (bits 56–63)**
+
+| Bit | Name | Description |
+|-----|------|-------------|
+| 56 | `InternalSystemError` | Unrecoverable system error. |
+| 57 | `DiskWriteFailed` | Write to disk failed. |
+| 58 | `DataCorrupted` | Stored data is corrupt. |
+| 63 | `FatalError` | Highest-bit fatal sentinel — unrecoverable. |
+
+</Accordion>
+
+<Accordion title="ExceptionFlags — all bit values">
+
+`ExceptionFlags` mirrors the .NET exception type hierarchy as bit flags. Each bit represents a specific exception class, allowing exception sets to be captured and compared without holding live exception objects.
+
+```csharp
+[Flags]
+public enum ExceptionFlags : ulong { ... }
+```
+
+**Base & Runtime (bits 0–7)**
+
+| Bit | Name |
+|-----|------|
+| 0 | `Exception` |
+| 1 | `SystemException` |
+| 2 | `ApplicationException` |
+| 3 | `NullReferenceException` |
+| 4 | `InvalidOperationException` |
+| 5 | `NotImplementedException` |
+| 6 | `NotSupportedException` |
+| 7 | `PlatformNotSupportedException` |
+
+**Arguments (bits 8–10)**
+
+| Bit | Name |
+|-----|------|
+| 8 | `ArgumentException` |
+| 9 | `ArgumentNullException` |
+| 10 | `ArgumentOutOfRangeException` |
+
+**Memory & Fatal Execution (bits 11–14)**
+
+| Bit | Name |
+|-----|------|
+| 11 | `OutOfMemoryException` |
+| 12 | `StackOverflowException` |
+| 13 | `ExecutionEngineException` |
+| 14 | `AccessViolationException` |
+
+**Math & Types (bits 15–20)**
+
+| Bit | Name |
+|-----|------|
+| 15 | `DivideByZeroException` |
+| 16 | `OverflowException` |
+| 17 | `ArithmeticException` |
+| 18 | `FormatException` |
+| 19 | `InvalidCastException` |
+| 20 | `IndexOutOfRangeException` |
+
+**Tasks & Threading (bits 21–27)**
+
+| Bit | Name |
+|-----|------|
+| 21 | `TimeoutException` |
+| 22 | `OperationCanceledException` |
+| 23 | `TaskCanceledException` |
+| 24 | `AggregateException` |
+| 25 | `ThreadAbortException` |
+| 26 | `ThreadInterruptedException` |
+| 27 | `ThreadStateException` |
+
+**Files & I/O (bits 28–33)**
+
+| Bit | Name |
+|-----|------|
+| 28 | `IOException` |
+| 29 | `FileNotFoundException` |
+| 30 | `DirectoryNotFoundException` |
+| 31 | `PathTooLongException` |
+| 32 | `EndOfStreamException` |
+| 33 | `InvalidDataException` |
+
+**Network & Web (bits 34–36)**
+
+| Bit | Name |
+|-----|------|
+| 34 | `SocketException` |
+| 35 | `HttpRequestException` |
+| 36 | `WebException` |
+
+**Database & Data (bits 37–39)**
+
+| Bit | Name |
+|-----|------|
+| 37 | `DataException` |
+| 38 | `DBConcurrencyException` |
+| 39 | `SqlException` |
+
+**Security & Access (bits 40–42)**
+
+| Bit | Name |
+|-----|------|
+| 40 | `UnauthorizedAccessException` |
+| 41 | `SecurityException` |
+| 42 | `CryptographicException` |
+
+**Collections (bits 43–45)**
+
+| Bit | Name |
+|-----|------|
+| 43 | `KeyNotFoundException` |
+| 44 | `RankException` |
+| 45 | `ArrayTypeMismatchException` |
+
+**Serialization & Formats (bits 46–48)**
+
+| Bit | Name |
+|-----|------|
+| 46 | `SerializationException` |
+| 47 | `XmlException` |
+| 48 | `JsonException` |
+
+**Reflection & Type Loading (bits 49–55)**
+
+| Bit | Name |
+|-----|------|
+| 49 | `TypeInitializationException` |
+| 50 | `TypeLoadException` |
+| 51 | `MissingMemberException` |
+| 52 | `MissingFieldException` |
+| 53 | `MissingMethodException` |
+| 54 | `AmbiguousMatchException` |
+| 55 | `BadImageFormatException` |
+
+**Low-level & Rare (bits 56–63)**
+
+| Bit | Name |
+|-----|------|
+| 56 | `InvalidProgramException` |
+| 57 | `AppDomainUnloadedException` |
+| 58 | `CannotUnloadAppDomainException` |
+| 59 | `ContextMarshalException` |
+| 60 | `DuplicateWaitObjectException` |
+| 61 | `FieldAccessException` |
+| 62 | `MethodAccessException` |
+| 63 | `DataMisalignedException` |
+
+</Accordion>
+
+### Combining flags — example
+
+```csharp
+// Build a combined error flag for diagnostics
+ErrorFlags diagnostics = ErrorFlags.NullParameter | ErrorFlags.MissingRequiredData;
+
+if (diagnostics.HasFlag(ErrorFlags.NullParameter))
+    Console.WriteLine("Null parameter detected.");
+
+// Capture exception type metadata without holding the exception
+ExceptionFlags captured = ExceptionFlags.None;
+try { /* ... */ }
+catch (FileNotFoundException) { captured |= ExceptionFlags.FileNotFoundException; }
+catch (IOException)           { captured |= ExceptionFlags.IOException; }
+
+Console.WriteLine($"Exceptions seen: {captured}");
+```

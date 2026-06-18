@@ -1,0 +1,548 @@
+---
+title: "TerbinCommunicator: Named-Pipe IPC Client and Server"
+sidebarTitle: "TerbinCommunicator"
+description: "Full API reference for TerbinCommunicator — constructor, connection methods, send/communicate methods, events, and static pipe factory helpers."
+---
+
+`TerbinCommunicator` is the central class in Terbin for inter-process communication over Windows named pipes. A single instance operates in either **server** or **client** mode and manages the full lifecycle of packet exchange: connection, background send/receive loops, request queuing, fragmentation, and timeout tracking. It implements `IDisposable` for safe resource cleanup.
+
+---
+
+## Constructor
+
+```csharp
+public TerbinCommunicator(
+    bool pIsServer = false,
+    CancellationToken pTokenCancellation = default,
+    string pName = "TerbinPipe")
+```
+
+Creates a new communicator instance. When `pIsServer` is `true`, the instance immediately begins waiting for an incoming client connection asynchronously, starts background send/receive loops on connect, and fires `OnNewClientConnect`. When `false`, the pipe is a client that must call `Connect()` or `TryConnect()` manually.
+
+<ParamField path="pIsServer" type="bool" default="false">
+  `true` to operate as the server side of the named pipe; `false` for client mode.
+</ParamField>
+
+<ParamField path="pTokenCancellation" type="CancellationToken" default="default">
+  Cancellation token that stops background send and receive tasks when cancelled.
+</ParamField>
+
+<ParamField path="pName" type="string" default="TerbinPipe">
+  The name of the named pipe. Both ends must use the same name to connect.
+</ParamField>
+
+<CodeGroup>
+
+```csharp Server setup
+using var cts = new CancellationTokenSource();
+
+var server = new TerbinCommunicator(
+    pIsServer: true,
+    pTokenCancellation: cts.Token,
+    pName: "MyModPipe");
+
+server.OnNewClientConnect += async () =>
+{
+    Console.WriteLine("Client connected!");
+};
+
+server.OnRecive += async (packet) =>
+{
+    // Handle incoming packet and return a response
+    return InfoResponse.CreateSucces(packet.Head.IdRequest);
+};
+```
+
+```csharp Client setup
+using var cts = new CancellationTokenSource();
+
+var client = new TerbinCommunicator(
+    pIsServer: false,
+    pTokenCancellation: cts.Token,
+    pName: "MyModPipe");
+
+bool connected = await client.Connect();
+if (connected)
+    Console.WriteLine("Connected to server.");
+```
+
+</CodeGroup>
+
+---
+
+## Properties
+
+### IsServer
+
+```csharp
+public bool IsServer { get; }
+```
+
+Indicates whether this instance was initialized as the server side of the pipe. Set once in the constructor and cannot be changed afterwards.
+
+---
+
+### MaximumResponseTime
+
+```csharp
+public ushort MaximumResponseTime { get; set; }
+```
+
+Maximum number of seconds to wait for a response when using `Communicate()`. Defaults to `TerbinProtocol.MAXIMUS_RESPONSE_TIME` (8 seconds). If the timeout expires, `Communicate()` returns a `PacketRequest` whose `Head.Status` is `CodeStatus.OverMaximumTime`.
+
+<Tip>
+  Call `GiveProlong(idRequest)` from inside a handler to extend the timeout for a long-running operation without changing this global value.
+</Tip>
+
+---
+
+### IsConnect
+
+```csharp
+public bool IsConnect { get; }
+```
+
+Returns `true` when the underlying `PipeStream` reports it is currently connected. Read-only computed property backed directly by `PipeStream.IsConnected`.
+
+---
+
+## Events
+
+### OnRecive
+
+```csharp
+public event Func<PacketRequest, Task<InfoResponse?>>? OnRecive
+```
+
+Fires for every fully assembled, valid incoming packet. The delegate receives the reconstructed `PacketRequest` (with memory fragments already merged into `Payload`) and must return either:
+
+- An `InfoResponse` value — `TerbinCommunicator` automatically calls `Reply()` with the returned value.
+- `null` — suppresses the automatic reply. Use this when you have already replied via `GiveResponse()`, or when the packet is fire-and-forget.
+
+<Warning>
+  Only one handler chain is invoked per packet. If multiple delegates are added to `OnRecive`, only the last registered delegate's return value is used for the reply.
+</Warning>
+
+---
+
+### OnNewClientConnect
+
+```csharp
+public event Func<Task>? OnNewClientConnect
+```
+
+Fires on the server side when a new client successfully connects and background tasks have started. Use this event to spin up a new server instance so additional clients can connect.
+
+```csharp
+server.OnNewClientConnect += async () =>
+{
+    // Spawn a new server instance to accept the next client
+    var nextServer = new TerbinCommunicator(
+        pIsServer: true,
+        pTokenCancellation: cts.Token,
+        pName: "MyModPipe");
+    nextServer.OnRecive += MyHandler;
+    nextServer.OnNewClientConnect += ...; // chain again
+};
+```
+
+<Note>
+  This event only fires on server-mode instances (`IsServer == true`). Attaching it on a client has no effect.
+</Note>
+
+---
+
+## Connection Methods
+
+### TryConnect
+
+```csharp
+public async Task<bool> TryConnect()
+```
+
+Connects to the server pipe only if the pipe is not already connected and this instance is not a server. Useful as an idempotent "connect if needed" guard.
+
+<ResponseField name="return" type="Task&lt;bool&gt;">
+  `true` if a new connection was established; `false` if already connected, already a server, or connection failed.
+</ResponseField>
+
+---
+
+### Connect
+
+```csharp
+public async Task<bool> Connect()
+```
+
+Calls `ConnectAsync()` on the underlying `NamedPipeClientStream` and starts the background send and receive loops. Must be called once on client-mode instances before sending or receiving packets.
+
+<ResponseField name="return" type="Task&lt;bool&gt;">
+  `true` if the connection succeeded; `false` if this instance is not a client pipe.
+</ResponseField>
+
+---
+
+## Send Methods
+
+### Communicate
+
+```csharp
+public async Task<PacketRequest> Communicate(
+    IdArray pActionMethod,
+    byte[] pPayload,
+    CodeStatus pStatus = CodeStatus.Execute,
+    ushort? pId = null)
+```
+
+Sends a packet and **blocks asynchronously** until a response with the same request ID is received (or the timeout expires). This is the primary method when you need a confirmed result from the other side.
+
+<ParamField path="pActionMethod" type="IdArray" required>
+  The action routing key identifying the handler to invoke on the other end.
+</ParamField>
+
+<ParamField path="pPayload" type="byte[]" required>
+  The raw data body to transmit. Automatically fragmented if it exceeds `TerbinProtocol.MAX_PLD` (0xFFF0 bytes).
+</ParamField>
+
+<ParamField path="pStatus" type="CodeStatus" default="CodeStatus.Execute">
+  The status code stamped into the outgoing packet header.
+</ParamField>
+
+<ParamField path="pId" type="ushort?" default="null">
+  Explicit request ID. When `null`, a new ID is generated via `MiniID.NewS`.
+</ParamField>
+
+<ResponseField name="return" type="Task&lt;PacketRequest&gt;">
+  The response packet. Check `Head.Status` for success (`CodeStatus.Succes`) or error codes such as `CodeStatus.OverMaximumTime`.
+</ResponseField>
+
+---
+
+### Send
+
+```csharp
+public async Task<PacketRequest?> Send(
+    IdArray pActionMethod,
+    byte[] pPayload,
+    CodeStatus pStatus = CodeStatus.Execute,
+    ushort? pId = null)
+```
+
+Sends a packet **without waiting** for a response (fire-and-forget). The response, if any, will arrive later via `OnRecive`.
+
+<ParamField path="pActionMethod" type="IdArray" required>
+  The action routing key.
+</ParamField>
+
+<ParamField path="pPayload" type="byte[]" required>
+  The data body to transmit.
+</ParamField>
+
+<ParamField path="pStatus" type="CodeStatus" default="CodeStatus.Execute">
+  The status code to embed in the packet header.
+</ParamField>
+
+<ParamField path="pId" type="ushort?" default="null">
+  Explicit request ID. When `null`, a new ID is generated via `MiniID.NewS`.
+</ParamField>
+
+<ResponseField name="return" type="Task&lt;PacketRequest?&gt;">
+  `null` on success. Returns an error `PacketRequest` (e.g., `CodeStatus.OverMaximunPacket`) only if fragmentation fails.
+</ResponseField>
+
+---
+
+### SendBytes
+
+```csharp
+public async Task<PacketRequest?> SendBytes(
+    IdArray pActionMethod,
+    CodeStatus pStatus = CodeStatus.Execute,
+    ushort? pId = null,
+    params byte[] pPayload)
+```
+
+Convenience overload of `Send` that accepts the payload as a `params byte[]` for inline byte literals.
+
+<ParamField path="pActionMethod" type="IdArray" required>
+  The action routing key.
+</ParamField>
+
+<ParamField path="pStatus" type="CodeStatus" default="CodeStatus.Execute">
+  The status code to embed in the packet header.
+</ParamField>
+
+<ParamField path="pId" type="ushort?" default="null">
+  Explicit request ID.
+</ParamField>
+
+<ParamField path="pPayload" type="params byte[]" required>
+  Individual bytes passed inline as variadic arguments.
+</ParamField>
+
+<ResponseField name="return" type="Task&lt;PacketRequest?&gt;">
+  `null` on success or a fragmentation error packet.
+</ResponseField>
+
+```csharp
+// Send a single-byte command without constructing an array
+await communicator.SendBytes(
+    new IdArray((byte)CodeServices.Ping),
+    CodeStatus.Execute,
+    null,
+    0x01);
+```
+
+---
+
+## Fragmentation Methods
+
+These methods are `public` but are primarily called internally by the send pipeline. You may call them directly when building custom fragmentation logic.
+
+### HandleSendSigle
+
+```csharp
+public async Task HandleSendSigle(
+    IdArray pActionMethod,
+    byte[] pPayload,
+    ushort pIdRequest,
+    CodeStatus pStatus)
+```
+
+Enqueues a single, unfragmented packet for transmission. Called automatically by `Send` / `Communicate` when `pPayload.Length <= TerbinProtocol.MAX_PLD`.
+
+<ParamField path="pActionMethod" type="IdArray" required>
+  The action routing key for the packet.
+</ParamField>
+<ParamField path="pPayload" type="byte[]" required>
+  Data that fits within one packet.
+</ParamField>
+<ParamField path="pIdRequest" type="ushort" required>
+  The request ID to stamp into the header.
+</ParamField>
+<ParamField path="pStatus" type="CodeStatus" required>
+  The status code for the header.
+</ParamField>
+
+---
+
+### HandleSendFragment
+
+```csharp
+public async Task<PacketRequest?> HandleSendFragment(
+    IdArray pActionMethod,
+    byte[] pPayload,
+    ushort pIdRequest,
+    CodeStatus pStatus)
+```
+
+Handles payloads that exceed `TerbinProtocol.MAX_PLD` by splitting them into `FRAGMENT_IN`-byte (0xFFAA) chunks, requesting a remote memory slot via `SoliciteRequestMemory()`, uploading each fragment via `Load()`, and then sending the final packet.
+
+<ResponseField name="return" type="Task&lt;PacketRequest?&gt;">
+  `null` on success. Returns an error packet if `CheckExecution` fails, memory cannot be allocated, or the packet count exceeds `TerbinProtocol.FINAL_PACKET`.
+</ResponseField>
+
+---
+
+### SoliciteRequestMemory
+
+```csharp
+public async Task<PacketRequest> SoliciteRequestMemory()
+```
+
+Sends a `CodeTerbinProtocol.Solicit` packet to the remote end and awaits a memory slot ID in `Payload[0]`. Called internally before uploading fragments.
+
+<ResponseField name="return" type="Task&lt;PacketRequest&gt;">
+  Response packet. On success, `Head.Status == CodeStatus.Succes` and `Payload[0]` contains the allocated memory ID.
+</ResponseField>
+
+---
+
+### Load
+
+```csharp
+public async Task<bool> Load(
+    ushort pOrderRequest,
+    byte pIdMemory,
+    byte[] pPayload,
+    ushort? pIdRequest = null)
+```
+
+Uploads a single fragment to a previously allocated remote memory slot. Throws if `pPayload.Length >= TerbinProtocol.MAX_PLD`.
+
+<ParamField path="pOrderRequest" type="ushort" required>
+  The fragment's position in the sequence (1-based, `ushort.MaxValue` reserved for the final packet).
+</ParamField>
+
+<ParamField path="pIdMemory" type="byte" required>
+  The memory slot ID returned by `SoliciteRequestMemory()`.
+</ParamField>
+
+<ParamField path="pPayload" type="byte[]" required>
+  The fragment bytes. Must be smaller than `TerbinProtocol.MAX_PLD`.
+</ParamField>
+
+<ParamField path="pIdRequest" type="ushort?" default="null">
+  The parent request ID. Auto-generated if `null`.
+</ParamField>
+
+<ResponseField name="return" type="Task&lt;bool&gt;">
+  Always `true` on success; throws on payload size violation.
+</ResponseField>
+
+---
+
+## Response and Queue Methods
+
+### GiveResponse
+
+```csharp
+public void GiveResponse(PacketRequest pCapsule)
+```
+
+Manually resolves a pending `Communicate()` awaiter identified by `pCapsule.Head.IdRequest`. Use this from inside an `OnRecive` handler when you need to resolve the awaiter early (e.g., before an async sub-operation completes) and then return `null` to suppress the automatic reply.
+
+<ParamField path="pCapsule" type="PacketRequest" required>
+  The packet to deliver as the response. Its `Head.IdRequest` must match the ID of a pending `Communicate()` call.
+</ParamField>
+
+---
+
+### GiveProlong
+
+```csharp
+public void GiveProlong(ushort pIdRequest)
+```
+
+Resets the timeout clock for a pending `Communicate()` call to another full `MaximumResponseTime` seconds. Call this from a long-running handler to prevent the caller from timing out.
+
+<ParamField path="pIdRequest" type="ushort" required>
+  The request ID whose timeout should be extended.
+</ParamField>
+
+---
+
+### Reply
+
+```csharp
+public async Task Reply(InfoResponse pInfo)
+```
+
+Sends a response back to the caller by routing through the normal `send` pipeline using the fields of `pInfo`. This is called automatically when `OnRecive` returns a non-null `InfoResponse`, but you can call it directly for deferred replies.
+
+<ParamField path="pInfo" type="InfoResponse" required>
+  The structured response to send. `pInfo.IdRequest` must match the original request's ID.
+</ParamField>
+
+---
+
+### addQueue
+
+```csharp
+public async Task addQueue(PacketRequest pCapsule)
+```
+
+Directly enqueues a pre-built `PacketRequest` into the outbound send queue and signals the background send loop. Prefer `Send` / `Communicate` for normal usage.
+
+<ParamField path="pCapsule" type="PacketRequest" required>
+  A fully constructed packet ready to be transmitted.
+</ParamField>
+
+---
+
+## Static Pipe Helpers
+
+These static members simplify named-pipe creation with Terbin's recommended settings (asynchronous, bidirectional, byte-transmission mode).
+
+### NewTerbinPipe
+
+```csharp
+public static NamedPipeServerStream NewTerbinPipe { get; }
+```
+
+Creates and returns a new `NamedPipeServerStream` using default settings and the default pipe name `"TerbinPipe"`. Each access creates a new stream.
+
+---
+
+### NewClientTerbinPipe
+
+```csharp
+public static NamedPipeClientStream NewClientTerbinPipe { get; }
+```
+
+Creates and returns a new `NamedPipeClientStream` using default settings and the default pipe name `"TerbinPipe"`. Each access creates a new stream.
+
+---
+
+### CreateServerPipe
+
+```csharp
+public static NamedPipeServerStream CreateServerPipe(string pName = "TerbinPipe")
+```
+
+Creates a `NamedPipeServerStream` with `PipeDirection.InOut`, `MaxAllowedServerInstances`, `PipeTransmissionMode.Byte`, and `PipeOptions.Asynchronous`.
+
+<ParamField path="pName" type="string" default="TerbinPipe">
+  The pipe name. Must match the name used by the client.
+</ParamField>
+
+---
+
+### CreateClientPipe
+
+```csharp
+public static NamedPipeClientStream CreateClientPipe(string pName = "TerbinPipe")
+```
+
+Creates a `NamedPipeClientStream` targeting the local machine (`.`) with `PipeDirection.InOut` and `PipeOptions.Asynchronous`.
+
+<ParamField path="pName" type="string" default="TerbinPipe">
+  The pipe name. Must match the name used by the server.
+</ParamField>
+
+<CodeGroup>
+
+```csharp Using factory helpers directly
+// Build a custom server using the factory, then hand it to TerbinCommunicator
+NamedPipeServerStream pipe = TerbinCommunicator.CreateServerPipe("PluginManagerPipe");
+// pipe can be wrapped or inspected before being used
+```
+
+```csharp Full round-trip example
+// --- Server process ---
+var cts = new CancellationTokenSource();
+var server = new TerbinCommunicator(true, cts.Token, "PluginManagerPipe");
+
+server.OnRecive += async (packet) =>
+{
+    byte[] responseData = System.Text.Encoding.UTF8.GetBytes("pong");
+    return InfoResponse.CreateSucces(packet.Head.IdRequest, responseData);
+};
+
+// --- Client process ---
+var client = new TerbinCommunicator(false, cts.Token, "PluginManagerPipe");
+await client.Connect();
+
+var action  = new IdArray((byte)CodeServices.Ping);
+var payload = System.Text.Encoding.UTF8.GetBytes("ping");
+
+PacketRequest response = await client.Communicate(action, payload);
+
+if (response.Head.Status == CodeStatus.Succes)
+    Console.WriteLine("Server replied: " + System.Text.Encoding.UTF8.GetString(response.Payload));
+```
+
+</CodeGroup>
+
+---
+
+## IDisposable
+
+`TerbinCommunicator` implements `IDisposable`. Always dispose the instance (or use a `using` block) to close the pipe and release stream resources.
+
+```csharp
+await using var communicator = new TerbinCommunicator(false, cts.Token);
+await communicator.Connect();
+// ... use communicator ...
+// Disposed automatically at end of scope
+```

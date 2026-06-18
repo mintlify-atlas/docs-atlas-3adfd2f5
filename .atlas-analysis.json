@@ -1,0 +1,132 @@
+{
+  "projectType": "framework",
+  "projectName": "Terbin",
+  "projectDescription": "A C# framework for building mod management services using named-pipe IPC, binary packet serialization, and a reflection-based executable dispatcher — designed for the Farlands modding ecosystem.",
+  "theme": "aspen",
+  "primaryColor": "#3B6FD4",
+  "lightColor": "#EEF3FF",
+  "darkColor": "#1A2E5A",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Getting Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "architecture"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/communication",
+              "concepts/protocol",
+              "concepts/execution",
+              "concepts/memory",
+              "concepts/serialization"
+            ]
+          },
+          {
+            "group": "Services",
+            "pages": [
+              "services/instances",
+              "services/plugins",
+              "services/plugin-storage",
+              "services/games",
+              "services/configuration"
+            ]
+          },
+          {
+            "group": "Configuration & Deployment",
+            "pages": [
+              "guides/setup",
+              "guides/simulate-client",
+              "guides/steam-proton"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Communication",
+            "pages": [
+              "api/terbin-communicator",
+              "api/packets",
+              "api/info-response"
+            ]
+          },
+          {
+            "group": "Execution",
+            "pages": [
+              "api/terbin-executable-attribute",
+              "api/executable-dispatcher",
+              "api/terbin-executor"
+            ]
+          },
+          {
+            "group": "Data & Serialization",
+            "pages": [
+              "api/serialineitor",
+              "api/buffer-reader-writer",
+              "api/terbin-memory",
+              "api/manifests"
+            ]
+          },
+          {
+            "group": "Enumerations & Status Codes",
+            "pages": [
+              "api/code-status",
+              "api/code-services",
+              "api/error-codes"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Named-pipe IPC via TerbinCommunicator for client-server communication",
+    "Reflection-based executable dispatcher using [TerbinExecutable] attribute",
+    "Binary packet protocol with fragmentation support for large payloads",
+    "Plugin management: download, install, uninstall, and enumerate mods per instance",
+    "Game instance lifecycle management (create, delete, list, get)",
+    "Plugin storage registry with reference tracking",
+    "Custom binary serialization with BufferWriter/BufferReader and Span-based API",
+    "Thread-safe in-memory fragment assembly via TerbinMemory",
+    "Steam/Proton integration and Farlands game launcher utilities",
+    "Progress reporting for long-running operations (download, install)"
+  ],
+  "publicApiSurface": [
+    "TerbinCommunicator(bool isServer, CancellationToken, string name)",
+    "TerbinCommunicator.Connect() / TryConnect()",
+    "TerbinCommunicator.Send(IdArray, byte[], CodeStatus, ushort?)",
+    "TerbinCommunicator.Communicate(IdArray, byte[], CodeStatus, ushort?)",
+    "TerbinCommunicator.Reply(InfoResponse)",
+    "TerbinCommunicator.OnRecive event",
+    "TerbinCommunicator.OnNewClientConnect event",
+    "[TerbinExecutable(byte action, byte subAction)] attribute",
+    "TerbinExecutableManager.DispatchAsync(Header, byte[], IEquatable<IEnumerable<byte>>)",
+    "TerbinExecutableManager.Register(IExecutableAttribute, TerbinExecutableDelegate)",
+    "TerbinExecutableManager.RegisterFromAssembly(Assembly)",
+    "TerbinExecutor.Register(Assembly)",
+    "ExecutableDispatcher.Register / Unregister / DispatchAsync",
+    "ServiceInstances: CreateInstance, DeleteInstances, GetAllInstances, GetOne",
+    "ServicePlugins: DowloadPlugin, InstallPlugin, GetAll, GetOne, Delete",
+    "ServicePluginStorage: GetAll, GetOne, Delete",
+    "ServiceGames: CloneGame, DeletedGame, ExecuteGame",
+    "ServiceConfiguration: ReadRute, UpdateRute",
+    "Serialineitor.Serialize<T> / DeserializeArray<T>",
+    "BufferWriter.Add / AddArray / AddStruct",
+    "BufferReader.Read / ReadArray",
+    "TerbinMemory.AddFragment / TryGetFullData / Release",
+    "TerbinProtocol constants: MAX_PLD, FRAGMENT_IN, MAXIMUS_RESPONSE_TIME",
+    "CodeStatus enum",
+    "CodeServices / CodeServicesSection enums",
+    "TerbinConfiguration constants: RUTE_FARLANDS, RUTE_INSTANCES, RUTE_STORAGE_PLUGINS, RUTE_STEAM, RUTE_PROTON"
+  ]
+}

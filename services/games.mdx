@@ -1,0 +1,210 @@
+---
+title: "Game Service: Clone, Delete, and Launch Game Instances"
+sidebarTitle: "Games"
+description: "ServiceGames exposes operations to duplicate a Farlands installation into an instance, remove the game files from an instance, and launch the game."
+---
+
+`ServiceGames` is a static handler class that manages the game-file layer of a Terbin instance — the actual Farlands installation that lives inside an instance directory. A Terbin instance is an isolated container: first the container is created via `ServiceInstances`, and then the game files are cloned into it here. Plugins can be installed before or after cloning.
+
+All three operations delegate to `Manager.Games`, which uses `NodeUtil.CloneDirectory` and `NodeUtil.DeleteFromHandwritten` for filesystem work and `ManagerFarlands.LaunchGame` for process launch.
+
+## Error Response Format
+
+All three endpoints return errors via `InfoResponse.CreateInteralError`, which encodes a `ushort` `InternalErrors` code as the response payload. On any non-success response, read two bytes from the payload and cast to `InternalErrors`:
+
+```csharp
+ushort errorCode = Serialineitor.Deserialize<ushort>(response.Payload);
+InternalErrors error = (InternalErrors)errorCode;
+```
+
+---
+
+## Operations
+
+<Accordion title="CloneGame — (TerbinCRUD.Duplicate, CodeServicesSection.Game)">
+
+Copies an entire Farlands game directory into the named instance. Internally `Manager.Games.CloneInInstance` calls `NodeUtil.CloneDirectory` (which produces a `DirectoryHandwritten` log of every file copied), writes the log via `Manager.Manifest.WriteHandwritten`, searches the cloned directory for executable files, and updates the instance manifest with the first `.exe` found and the current game version from `ManagerFarlands.GetVersion()`.
+
+If cancelled mid-copy, the service calls `Manager.Games.RemoveInInstance` automatically to clean up any partially-copied files.
+
+**Action bytes:** `(byte)TerbinCRUD.Duplicate`, `(byte)CodeServicesSection.Game` = `10`
+
+### Request Payload
+
+<ParamField body="nameInstance" type="char[]" required>
+  The name of the target instance into which the game will be cloned. Encoded as a length-prefixed UTF-16 char array.
+</ParamField>
+
+<ParamField body="dirGame" type="char[]" required>
+  The absolute filesystem path to the source Farlands installation directory to copy from.
+</ParamField>
+
+<ParamField body="useProgress" type="bool">
+  Optional. When `true`, the service calls `NodeUtil.CountContent(dirGame)` to count the total number of filesystem entries, then passes that count as `MaxProgressDTO` to `ProgressUtil.CreateProgressAndSetMax`. Progress events are sent on `(CodeServices.Dowload, CodeServicesSection.Plugin)`.
+</ParamField>
+
+### Progress Reporting
+
+When `useProgress` is `true`, the client receives:
+
+1. **`SetMaxProgress`** — total number of filesystem entries (`long maxSize = (long)NodeUtil.CountContent(dirGame)`).
+2. **`SetBarProgress`** — repeated `TerbinInfoProgrss` ticks as each file is copied.
+
+<Tip>
+  This is a high-disk-I/O operation. Always pass `useProgress = true` in user-facing applications so the client can display a meaningful progress indicator.
+</Tip>
+
+### Response
+
+On success the response body is **empty**.
+
+On failure the payload contains a `ushort` `InternalErrors` code.
+
+### Error Conditions
+
+| `InternalErrors` value | Code | Meaning |
+|---|---|---|
+| `InstanceGet` | `307` | The named instance could not be found or its path could not be resolved. |
+| `GameAlredyExist` | `102` | The instance already has a game cloned into it (`Manager.Instances.ThereGameByPath` returned `true`). |
+| `IsCancelled` | `99` | The operation was cancelled. Partial files have been removed by the automatic cleanup call to `RemoveInInstance`. |
+| `ManifestUpdate` | `904` | The instance manifest could not be updated with the executable path and version after cloning. |
+| `IsUnknown` | `97` | `NodeUtil.CloneDirectory` returned a non-success `StatusNodeUtil`. |
+
+### Example
+
+```csharp
+Serialineitor s = new();
+s.AddArray<char>("MyInstance".ToCharArray());
+s.AddArray<char>("/home/user/.steam/steamapps/common/Farlands".ToCharArray());
+s.Add<bool>(true); // request progress
+
+var response = await client.Communicate(
+    (byte)TerbinCRUD.Duplicate,
+    (byte)CodeServicesSection.Game,
+    s.Serialize()
+);
+
+if (response.Status == CodeStatus.Succes)
+    Console.WriteLine("Game cloned into instance.");
+else
+{
+    ushort code = Serialineitor.Deserialize<ushort>(response.Payload);
+    Console.WriteLine($"Error: {(InternalErrors)code}");
+}
+```
+
+</Accordion>
+
+<Accordion title="DeletedGame — (TerbinCRUD.Deleted, CodeServicesSection.Game)">
+
+Removes all game files that were previously cloned into the named instance. The service resolves the instance path, then calls `Manager.Games.RemoveInInstance`, which reads the `DirectoryHandwritten` log written during `CloneGame` and uses `NodeUtil.DeleteFromHandwritten` to delete exactly the files that were copied. After deletion it removes the handwritten log file and resets the instance manifest's `Executable` and `Version` fields to empty strings.
+
+**Action bytes:** `(byte)TerbinCRUD.Deleted`, `(byte)CodeServicesSection.Game` = `10`
+
+### Request Payload
+
+<ParamField body="nameInstance" type="char[]" required>
+  The name of the instance from which game files should be removed.
+</ParamField>
+
+<ParamField body="useProgress" type="bool">
+  Optional. When `true`, the service counts the contents of the instance directory with `NodeUtil.CountContent(dirGame)` and sets up progress reporting on `(CodeServices.Dowload, CodeServicesSection.Plugin)`.
+</ParamField>
+
+### Progress Reporting
+
+Same structure as `CloneGame`: one `SetMaxProgress` message with the item count, followed by repeated `SetBarProgress` ticks.
+
+### Response
+
+On success the response body is **empty**.
+
+On failure the payload contains a `ushort` `InternalErrors` code.
+
+### Error Conditions
+
+| `InternalErrors` value | Code | Meaning |
+|---|---|---|
+| `InstanceNotExist` | `302` | The service could not resolve the instance's directory path (`Manager.Instances.GetPathFolder` returned empty). |
+| `InstanceGet` | `307` | `Manager.Games.RemoveInInstance` could not resolve the instance path internally. |
+| `HandwrittenGet` | `803` | The `DirectoryHandwritten` log could not be read — the game may not have been properly cloned, or the log file is missing. |
+| `HandwrittenRemove` | `802` | The handwritten log file was deleted successfully but the file-delete step for the log itself failed. |
+| `ManifestUpdate` | `904` | The instance manifest could not be updated to clear `Executable` and `Version` after deletion. |
+| `IsCancelled` | `99` | The operation was cancelled by the caller. Files already deleted are **not** restored. |
+
+<Warning>
+  File deletion based on `DirectoryHandwritten` is irreversible. Only files originally copied by `CloneGame` are targeted, but exercise caution if you have manually placed files in the instance directory with paths that overlap.
+</Warning>
+
+### Example
+
+```csharp
+Serialineitor s = new();
+s.AddArray<char>("MyInstance".ToCharArray());
+s.Add<bool>(false); // no progress
+
+var response = await client.Communicate(
+    (byte)TerbinCRUD.Deleted,
+    (byte)CodeServicesSection.Game,
+    s.Serialize()
+);
+
+if (response.Status == CodeStatus.Succes)
+    Console.WriteLine("Game files removed from instance.");
+```
+
+</Accordion>
+
+<Accordion title="ExecuteGame — (CodeServices.Execute, CodeServicesSection.Game)">
+
+Launches the game executable stored inside the named instance. The service calls `Manager.Games.RunInInstance`, which loads the instance manifest to read `ManifestInstance.Executable`, builds the full path by combining the instance directory with the relative executable path, and then calls `ManagerFarlands.LaunchGame(path)` (which wraps a `Process.Start` call, with Linux/Proton support noted as TODO in the source).
+
+**Action bytes:** `(byte)CodeServices.Execute` = `12`, `(byte)CodeServicesSection.Game` = `10`
+
+### Request Payload
+
+<ParamField body="nameInstance" type="char[]" required>
+  The name of the instance to launch.
+</ParamField>
+
+### Response
+
+On success the response body is **empty**. The game process is launched asynchronously; the service does not wait for the process to exit.
+
+On failure the payload contains a `ushort` `InternalErrors` code.
+
+### Error Conditions
+
+| `InternalErrors` value | Code | Meaning |
+|---|---|---|
+| `InstanceNotExist` | `302` | The instance directory could not be resolved. |
+| `ManifestGet` | `903` | The instance manifest could not be deserialized. |
+| `GameNotContainExes` | `103` | `ManifestInstance.Executable` is `null` — no game has been cloned into the instance yet. |
+| `GameNotLaunch` | `104` | `ManagerFarlands.LaunchGame` returned `false` — the process could not be started (executable missing, permission denied, etc.). |
+
+<Info>
+  On Linux, game launch goes through Proton. The `Run` method in `Manager.Games` is marked TODO for Linux-specific process wrapping. Ensure `rute_proton` and `rute_proton_tmp` are configured before launching if running under Proton.
+</Info>
+
+### Example
+
+```csharp
+Serialineitor s = new();
+s.AddArray<char>("MyInstance".ToCharArray());
+
+var response = await client.Communicate(
+    (byte)CodeServices.Execute,
+    (byte)CodeServicesSection.Game,
+    s.Serialize()
+);
+
+if (response.Status == CodeStatus.Succes)
+    Console.WriteLine("Game launched.");
+else
+{
+    ushort code = Serialineitor.Deserialize<ushort>(response.Payload);
+    Console.WriteLine($"Launch failed: {(InternalErrors)code}");
+}
+```
+
+</Accordion>

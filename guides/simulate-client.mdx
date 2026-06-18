@@ -1,0 +1,240 @@
+---
+title: "Using SimulateClient for Development and Testing"
+sidebarTitle: "Simulate Client"
+description: "How to use the SimulateClient project to interactively invoke Terbin service operations over the named pipe during development."
+---
+
+SimulateClient is the interactive test harness for TerbinService. Rather than requiring a full mod-manager front-end, it provides a minimal console REPL that connects to the service's named pipe and lets you invoke any service operation by typing its class name and method name. It is the primary tool for exploring and testing Terbin's IPC API during development.
+
+---
+
+## How It Works
+
+SimulateClient follows a straightforward reflection-based dispatch loop:
+
+1. It creates a `TerbinCommunicator` in **client mode** (`false`) and connects to the running service.
+2. It registers its own `[TerbinExecutable]` handlers so it can receive and print any response packets the service sends back.
+3. In a loop it reads a command string from stdin in the format `ClassName -MethodName`.
+4. It uses `Commands.GetClass()` and `Commands.GetMethod()` — two source-generated `Regex` helpers — to extract the class name and one or more `-MethodName` tokens from the input.
+5. It resolves the class with `Type.GetType("SimulateClient.<ClassName>")` and the method with `BindingFlags.Static | BindingFlags.Public`.
+6. It invokes the method, passing the shared `TerbinCommunicator communicator` instance.
+7. If the resolved method returns a `Task`, it `await`s it before prompting again.
+
+```csharp
+classType = Type.GetType($"SimulateClient.{@class}");
+// ...
+methodType = classType?.GetMethod(meth, BindingFlags.Static | BindingFlags.Public);
+
+var result = methodType.Invoke(null, new object[] { communicator });
+if (result is Task task)
+    await task;
+```
+
+<Note>
+  SimulateClient also calls `TerbinExecutor.Register(Assembly.GetExecutingAssembly())` on startup. This registers any static methods in the SimulateClient assembly that are decorated with `[TerbinExecutable]` as handlers for inbound response packets from the server — for example, progress updates and async notifications that the service pushes back to the client.
+</Note>
+
+---
+
+## Starting SimulateClient
+
+<Steps>
+  <Step title="Ensure TerbinService is running">
+    In a separate terminal, start the service:
+    ```bash
+    dotnet run --project TerbinService
+    ```
+    Wait until the startup TODO diagnostics finish printing and the service is listening on the pipe.
+  </Step>
+
+  <Step title="Run SimulateClient">
+    ```bash
+    dotnet run --project SimulateClient
+    ```
+  </Step>
+
+  <Step title="Confirm connection">
+    On a successful connection you will see:
+    ```
+    [Client] ¡Conectado!
+    -------( Start )---------
+    [Client] "Clase -Accion"
+    Command -> (  )
+    ```
+    If instead you see `[Client] ¡Error de Conexion!`, TerbinService is not running or the pipe name does not match.
+  </Step>
+</Steps>
+
+<Tip>
+  The entire interactive block in `SimulateClient/Program.cs` is wrapped in a `#if true … #else … #endif` gate. If you change the `#if true` to `#if false`, the project will compile and run but will immediately print:
+
+  ```
+  SimulateClient esta desactivado.
+  Ponga en false el if para activarlo.
+  ```
+
+  …and then exit without connecting. This makes it easy to disable the harness in CI builds or when you want the project to compile without interactivity.
+</Tip>
+
+---
+
+## Command Format
+
+```
+ClassName -MethodName
+```
+
+- **`ClassName`** — the name of one of the static command classes in the `SimulateClient` namespace (e.g. `Inst`, `Plug`, `Game`).
+- **`-MethodName`** — the name of the public static method to call, prefixed with a hyphen.
+- You can chain multiple methods in one line: `Inst -Create -GetAll`.
+- Two numeric shorthands are built in: `-1` resolves to `Yolo` and `-2` resolves to `LittleByLittle`.
+
+**Exit keywords** — type any of the following to disconnect and quit:
+
+```
+exit   ex   sa   salir   q
+```
+
+---
+
+## Available Command Classes
+
+<CardGroup cols={2}>
+  <Card title="Inst" icon="layer-group">
+    **Instance management.** Creates, reads, lists, and deletes Terbin game instances.
+
+    | Method | Description |
+    |---|---|
+    | `Create` | Prompts for an instance name and sends a `CodeServices.Create / Instances` packet. |
+    | `GetAll` | Retrieves all instances; prints each `ReferenceInstanceDTO`. |
+    | `GetOne` | Retrieves one instance by name; prints its `ManifestInstanceDTO`. |
+    | `Del` | Deletes an instance by name. |
+  </Card>
+
+  <Card title="Plug" icon="plug">
+    **Plugin management.** Installs, removes, lists, and queries plugins within instances or in the central plugin store.
+
+    | Method | Description |
+    |---|---|
+    | `Add` | Prompts for instance name and plugin GUID; sends an install packet. |
+    | `Del` | Prompts for instance name and plugin GUID; uninstalls the plugin from that instance. |
+    | `Rm` | Removes a plugin from the central plugin storage by GUID. |
+    | `GetAll` | Lists all plugins installed in a named instance (`ManifestPluginDTO` list). |
+    | `GetOne` | Gets one plugin by instance name and GUID. |
+  </Card>
+
+  <Card title="Game" icon="gamepad">
+    **Game instance operations.** Duplicates the base Farlands installation into an instance, deletes a game instance, or launches one.
+
+    | Method | Description |
+    |---|---|
+    | `Dup` | Duplicates the Farlands installation into a named instance (hardcoded source path for testing). |
+    | `Rm` | Deletes a game instance by name. |
+    | `Exe` | Launches a named game instance via `CodeServices.Execute`. |
+  </Card>
+
+  <Card title="Store" icon="database">
+    **Plugin store queries.** Lists and inspects entries in the central plugin storage directory.
+
+    | Method | Description |
+    |---|---|
+    | `GetAll` | Lists all plugins in the store (`ReferencePluginStoreDTO` list). |
+    | `GetOne` | Fetches one store entry by plugin GUID. |
+  </Card>
+
+  <Card title="Down" icon="download">
+    **Download operations.** Exercises the service's download pipeline against known URLs.
+
+    | Method | Description |
+    |---|---|
+    | `LittleByLittle` | Downloads BepInEx, UnityExplorer, and FCM sequentially, waiting for confirmation between each step. |
+    | `Yolo` | Fires all three downloads concurrently without waiting. |
+    | `D` | Prompts for an arbitrary URL and sends a single download request. |
+  </Card>
+
+  <Card title="Yolo" icon="bolt">
+    **Legacy end-to-end smoke test.** The `yolo_old` method (marked `[Obsolete]`) walks through the full workflow — get paths, create instance, duplicate Farlands, install BepInEx, install UnityExplorer, install FCM — step by step with `PressAnyKeyToContinue` prompts. Useful as a reference for the complete multi-step flow.
+  </Card>
+</CardGroup>
+
+---
+
+## Example Session
+
+```
+-------( Start )---------
+[Client] "Clase -Accion"
+Command -> ( Inst -Create )
+
+-------( Instance )---------
+[Client] "Nombre de la Instancia"
+[Client] name -> ( MyTestInstance )
+
+[Client] Result (Action: ... | Status: Succes | Memory: 0)
+CodeServices:Create
+[Client] ==> FIN
+[Client] Pulse cualquier tecla para continuar ...
+
+-------( Start )---------
+Command -> ( Inst -GetAll )
+
+**( ReferenceInstanceDTO )**
+  Name: MyTestInstance
+  ...
+----------
+[Client] ==> FIN
+
+-------( Start )---------
+Command -> ( Plug -Add )
+
+-------( Plugin )---------
+[Client] "1. Nombre de la Instancia | 2. GUID del plugin"
+[Client] 1. name -> ( MyTestInstance )
+[Client] 2. GUID -> ( com.example.myplugin )
+[Client] Result (Action: ... | Status: Succes | Memory: 0)
+Instalado Correctamente
+
+-------( Start )---------
+Command -> ( exit )
+```
+
+---
+
+## Registering Custom Command Classes
+
+SimulateClient discovers command classes at runtime purely through the `Type.GetType("SimulateClient.<name>")` lookup — there is no registry or attribute required. To add your own commands:
+
+1. Create a `static` class in the `SimulateClient` namespace.
+2. Add `public static async Task` methods that accept a single `TerbinCommunicator communicator` parameter.
+3. Build the project — your class and its methods are immediately available at the REPL.
+
+```csharp
+namespace SimulateClient;
+
+internal static class MyCommands
+{
+    public static async Task Ping(TerbinCommunicator communicator)
+    {
+        // send a packet, await the response, print result
+        var r = await communicator.Communicate(
+            new(CodeServices.Read, CodeServicesSection.Instances), []);
+        Console.WriteLine($"Status: {r.Head.Status}");
+    }
+}
+```
+
+Type `MyCommands -Ping` in the REPL to invoke it.
+
+---
+
+## Helper Utilities
+
+The `Helper` static class provides the utility methods used throughout all command classes:
+
+| Method | Description |
+|---|---|
+| `Helper.Read(string msg)` | Renders an inline prompt and reads a string from the console with live backspace support. |
+| `Helper.IsError(PacketRequest)` | Checks the response status; prints the error code (including `InternalErrors` enum values for `InternalWorkerError` packets) and calls `PressAnyKeyToContinue` on failure. Returns `true` if an error occurred. |
+| `Helper.PrintMethod(params byte[])` | Decodes the `ActionMethod` byte array into `CodeServices`, `CodeServicesSection`, and `CodeServicesClient` enum names and prints them. |
+| `Helper.Fin()` | Prints `[Client] ==> FIN` and waits for a keypress. |
+| `Helper.PressAnyKeyToContinue()` | Prints a prompt and waits for the user to press Enter, then delays 500 ms. |

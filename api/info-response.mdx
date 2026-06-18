@@ -1,0 +1,275 @@
+---
+title: "InfoResponse: Structured Service Response Type"
+sidebarTitle: "InfoResponse"
+description: "Reference for InfoResponse — the structured response type returned by Terbin service handlers, with static factory methods for common outcomes."
+---
+
+`InfoResponse` is the standard return type for every `[TerbinExecutable]` handler and the primary way to send replies through `TerbinCommunicator.Reply()`. Rather than constructing a raw `PacketRequest`, handlers build an `InfoResponse` value using one of the static `Create*` factory methods. The communicator then serializes and routes it back to the original caller automatically.
+
+```csharp
+public struct InfoResponse
+{
+    public ushort     IdRequest    { get; set; }
+    public CodeStatus Status       { get; set; }
+    public IdArray    ActionMethod { get; set; }
+    public byte[]     Payload      { get; set; }
+}
+```
+
+---
+
+## Fields
+
+<ParamField path="IdRequest" type="ushort">
+  The ID of the original `PacketRequest` being replied to. Must match `packet.Head.IdRequest` so the awaiting `Communicate()` call can be resolved.
+</ParamField>
+
+<ParamField path="Status" type="CodeStatus">
+  The outcome status of the handler. Common values:
+
+  | Value | Meaning |
+  |-------|---------|
+  | `CodeStatus.Succes` (200) | Operation completed successfully |
+  | `CodeStatus.IsCancelled` (103) | Operation was cancelled |
+  | `CodeStatus.InternalWorkerError` (500) | Unhandled error inside the handler |
+  | `CodeStatus.NotFound` (404) | Requested resource does not exist |
+  | `CodeStatus.ActionNotFound` (440) | No handler registered for the action |
+</ParamField>
+
+<ParamField path="ActionMethod" type="IdArray">
+  The action routing key embedded in the response packet. Defaults to `new IdArray((byte)CodeTerbinProtocol.Response)`, which marks the packet as a reply rather than a new inbound request. You rarely need to change this manually when using the factory methods.
+</ParamField>
+
+<ParamField path="Payload" type="byte[]">
+  The response data body. Empty (`[]`) for status-only replies. Serialized domain objects, raw bytes, or error details go here.
+</ParamField>
+
+---
+
+## Static Factory Methods
+
+All factory methods produce a fully initialised `InfoResponse` value. Use them instead of the default constructor to ensure `ActionMethod` is set correctly.
+
+### Create — status only
+
+```csharp
+public static InfoResponse Create(ushort pIdRequest, CodeStatus pStatus)
+```
+
+Generic factory for any status without a payload. The simplest way to acknowledge a request.
+
+<ParamField path="pIdRequest" type="ushort" required>
+  The request ID to reply to.
+</ParamField>
+<ParamField path="pStatus" type="CodeStatus" required>
+  The outcome status code.
+</ParamField>
+
+```csharp
+return InfoResponse.Create(packet.Head.IdRequest, CodeStatus.Succes);
+```
+
+---
+
+### Create — with payload
+
+```csharp
+public static InfoResponse Create(ushort pIdRequest, CodeStatus pStatus, params byte[] pPLD)
+```
+
+Generic factory with an inline `params byte[]` payload.
+
+<ParamField path="pIdRequest" type="ushort" required>
+  The request ID to reply to.
+</ParamField>
+<ParamField path="pStatus" type="CodeStatus" required>
+  The outcome status code.
+</ParamField>
+<ParamField path="pPLD" type="params byte[]" required>
+  The response payload bytes.
+</ParamField>
+
+```csharp
+byte[] data = System.Text.Encoding.UTF8.GetBytes("1.2.3");
+return InfoResponse.Create(packet.Head.IdRequest, CodeStatus.Succes, data);
+```
+
+---
+
+### CreateSucces — no payload
+
+```csharp
+public static InfoResponse CreateSucces(ushort pIdRequest)
+```
+
+Creates a `CodeStatus.Succes` response with an empty payload. The most common reply for void operations (install, delete, update) that simply need to signal completion.
+
+<ParamField path="pIdRequest" type="ushort" required>
+  The request ID to reply to.
+</ParamField>
+
+```csharp
+return InfoResponse.CreateSucces(packet.Head.IdRequest);
+```
+
+---
+
+### CreateSucces — with payload
+
+```csharp
+public static InfoResponse CreateSucces(ushort pIdRequest, byte[] pPLD)
+```
+
+Creates a `CodeStatus.Succes` response carrying a data payload. Use this for read operations that return serialized objects.
+
+<ParamField path="pIdRequest" type="ushort" required>
+  The request ID to reply to.
+</ParamField>
+<ParamField path="pPLD" type="byte[]" required>
+  The serialized response data.
+</ParamField>
+
+```csharp
+byte[] serialized = Serialineitor.SerializeStructRaw(myResult);
+return InfoResponse.CreateSucces(packet.Head.IdRequest, serialized);
+```
+
+---
+
+### CreateCancelled
+
+```csharp
+public static InfoResponse CreateCancelled(ushort pIdRequest)
+```
+
+Creates a `CodeStatus.IsCancelled` (103) response, indicating the operation was deliberately stopped before completing.
+
+<ParamField path="pIdRequest" type="ushort" required>
+  The request ID to reply to.
+</ParamField>
+
+```csharp
+if (cancellationToken.IsCancellationRequested)
+    return InfoResponse.CreateCancelled(packet.Head.IdRequest);
+```
+
+---
+
+### CreateInteralError
+
+```csharp
+public static InfoResponse CreateInteralError(ushort pIdRequest, params byte[] pPld)
+```
+
+Creates a `CodeStatus.InternalWorkerError` (500) response. Pass serialized `ExceptionDTO` bytes as the payload to give the caller full exception context.
+
+<ParamField path="pIdRequest" type="ushort" required>
+  The request ID of the failed operation.
+</ParamField>
+<ParamField path="pPld" type="params byte[]" required>
+  Error detail bytes — typically a serialized `ExceptionDTO`.
+</ParamField>
+
+```csharp
+catch (Exception ex)
+{
+    var dto     = new ExceptionDTO(ex, "PluginService>Install");
+    byte[] pld  = Serialineitor.SerializeStructRaw(dto);
+    return InfoResponse.CreateInteralError(packet.Head.IdRequest, pld);
+}
+```
+
+---
+
+### CreateResponseError *(on PacketRequest)*
+
+`PacketRequest` also exposes a static error factory that mirrors this pattern at the packet level:
+
+```csharp
+public static PacketRequest CreateResponseError(ushort pIdRequest, CodeStatus pError)
+```
+
+This is the low-level equivalent used internally by `HandleSendFragment`. For handler code, prefer `InfoResponse.Create(id, errorStatus)`.
+
+---
+
+## Typical Handler Pattern
+
+The handler below shows the full lifecycle: receive a packet, process it, and return an `InfoResponse`.
+
+```csharp
+communicator.OnRecive += async (PacketRequest packet) =>
+{
+    // Identify the action being requested
+    // (routing is normally handled by TerbinExecutor,
+    //  but shown here for clarity)
+
+    string pluginName = System.Text.Encoding.UTF8.GetString(packet.Payload);
+
+    bool installed = await pluginManager.InstallAsync(pluginName);
+
+    if (!installed)
+    {
+        return InfoResponse.Create(
+            packet.Head.IdRequest,
+            CodeStatus.InternalWorkerError);
+    }
+
+    return InfoResponse.CreateSucces(packet.Head.IdRequest);
+};
+```
+
+<Note>
+  Returning `null` from an `OnRecive` handler suppresses the automatic call to `Reply()`. Do this when you have already manually called `GiveResponse()` to resolve the awaiting `Communicate()` call, or when the packet was a pure fire-and-forget notification that requires no acknowledgement.
+</Note>
+
+---
+
+## Default Constructor
+
+```csharp
+public InfoResponse()
+```
+
+Initializes all fields to safe defaults:
+
+| Field | Default |
+|-------|---------|
+| `IdRequest` | `TerbinProtocol.ORDER_SINGLE` (0) |
+| `Status` | `CodeStatus.NotAsign` |
+| `ActionMethod` | `new IdArray((byte)CodeTerbinProtocol.Response)` |
+| `Payload` | `[]` |
+
+<Warning>
+  The default constructor leaves `Status` as `CodeStatus.NotAsign` (-1). Always set a meaningful status before returning or passing an `InfoResponse` to `Reply()`. Use one of the `Create*` factory methods to avoid this pitfall.
+</Warning>
+
+---
+
+## Full Read-Operation Example
+
+```csharp
+// Handler: return the list of installed mod IDs
+communicator.OnRecive += async (PacketRequest packet) =>
+{
+    var action = packet.ActionMethod;
+
+    // Guard: only handle our specific action key
+    if (action != new IdArray((byte)CodeServices.Plugin, (byte)CodeServicesSection.Read))
+        return null; // let another handler in the chain deal with it
+
+    try
+    {
+        IEnumerable<string> modIds = await modRepository.GetAllIdsAsync();
+        byte[] payload = JsonSerializer.SerializeToUtf8Bytes(modIds);
+
+        return InfoResponse.CreateSucces(packet.Head.IdRequest, payload);
+    }
+    catch (Exception ex)
+    {
+        var dto    = new ExceptionDTO(ex, "ModService>GetAllIds");
+        byte[] pld = Serialineitor.SerializeStructRaw(dto);
+        return InfoResponse.CreateInteralError(packet.Head.IdRequest, pld);
+    }
+};
+```

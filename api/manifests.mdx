@@ -1,0 +1,258 @@
+---
+title: "Data Models: Manifests, References, and DTOs"
+sidebarTitle: "Manifests"
+description: "Reference for Terbin's data model classes: ManifestInstance, ManifestPlugin, ReferenceInstance, ReferencePluginStore, and their IStructSerializable DTO counterparts."
+---
+
+Terbin's data layer uses two parallel class hierarchies: **manifest/reference classes** (rich domain objects stored as JSON on disk) and **DTO structs** (compact `IStructSerializable` structs sent over the named pipe). Every domain object implements `IToDTO<T>` and `IToSerializeDTO`, providing a `ToDTO()` → struct and a `ToSerilizeDTO()` → `byte[]` shortcut.
+
+---
+
+## Interfaces
+
+### IManifest (internal)
+
+```csharp
+internal interface IManifest
+{
+    string? GetId();
+}
+```
+
+Used internally so managers can address any manifest by a string identifier.
+
+### Transport interfaces
+
+| Interface | Method | Returns |
+|---|---|---|
+| `IToDTO<T>` | `ToDTO()` | `T` DTO struct |
+| `IToSerializeDTO` | `ToSerilizeDTO()` | `byte[]` serialized DTO |
+| `IDTO` | marker only | — |
+| `IPrintable` | `Print()` | void (debug console output) |
+
+---
+
+## ManifestInstance
+
+A rich in-memory representation of a game instance and its installed plugins. Stored as JSON inside the instance's directory by `ManagerInstances`.
+
+```csharp
+public class ManifestInstance : IManifest, IToDTO<ManifestInstanceDTO>, IToSerializeDTO
+{
+    public string? Name { get; set; }
+    public string? Version { get; set; }
+    public string? Executable { get; set; }
+    public List<ReferencePlugin> Plugins { get; set; } = [];
+}
+```
+
+**Conversions:**
+- `ToDTO()` → `ManifestInstanceDTO`
+- `ToSerilizeDTO()` → `byte[]`
+- Explicit cast: `(ManifestInstance)ManifestInstanceDTO` (restores Name and Version)
+
+---
+
+## ManifestInstanceDTO
+
+The wire format sent when a client requests instance details via `ServiceInstances.GetOne`.
+
+```csharp
+public struct ManifestInstanceDTO : IStructSerializable, IPrintable
+{
+    public string? Name { get; set; }
+    public string? Version { get; set; }
+    public ThreeQuartersInt PluginCount { get; set; }
+}
+```
+
+**Wire layout (WriteTo/ReadFrom order):**
+
+| Field | Type | Encoding |
+|---|---|---|
+| `Name` | `string?` | `char[]` with 3-byte length prefix |
+| `Version` | `string?` | `char[]` with 3-byte length prefix |
+| `PluginCount` | `ThreeQuartersInt` | 3 bytes |
+
+**Explicit cast:** `(ManifestInstanceDTO)ManifestInstance` copies Name, Version, Plugins.Count.
+
+---
+
+## ReferenceInstance
+
+A lightweight index entry for a game instance. Stored in the global `ManifestIndex` so the service can locate an instance by name without reading its full manifest.
+
+```csharp
+public class ReferenceInstance : IToDTO<ReferenceInstanceDTO>, IToSerializeDTO
+{
+    public string? Name;
+    public bool? OutSide;   // true if the instance lives outside the default instances directory
+    public string? Path;    // filesystem path to the instance folder
+}
+```
+
+---
+
+## ReferenceInstanceDTO
+
+Wire format for `ReferenceInstance`, used in `ServiceInstances.GetAllInstances` responses.
+
+```csharp
+public struct ReferenceInstanceDTO : IStructSerializable, IPrintable
+{
+    public string? Name;
+    public bool? OutSide;
+    public string? Path;
+}
+```
+
+**Wire layout:**
+
+| Field | Type | Encoding |
+|---|---|---|
+| `Name` | `string?` | `char[]` with 3-byte length prefix |
+| `OutSide` | `bool?` | `sbyte` (1 byte, nullable tri-state) |
+| `Path` | `string?` | `char[]` with 3-byte length prefix |
+
+---
+
+## ManifestPlugin
+
+The full record of an installed plugin within a game instance. Stored as JSON in the instance's plugin manifest by `ManagerPlugin`.
+
+```csharp
+public class ManifestPlugin : IManifest, IToDTO<ManifestPluginDTO>, IToSerializeDTO
+{
+    public string? Name { get; set; }
+    public string? Id { get; set; }          // ID in the plugin storage registry
+    public string? IdLocal { get; set; }     // unique ID generated at install time
+    public bool? OutSideIntance { get; set; } // true if installed outside the instance path
+    public DirectoryHandwritten HandWritten { get; set; } = new();
+}
+```
+
+<Note>
+`Id` identifies the plugin in the global plugin storage (`ReferencePluginStore`). `IdLocal` is a separate identifier generated when the plugin is installed into a specific instance, allowing the same plugin to be registered multiple times in one instance.
+</Note>
+
+---
+
+## ManifestPluginDTO
+
+Wire format for `ManifestPlugin`, used in `ServicePlugins.GetAll` and `ServicePlugins.GetOne` responses.
+
+```csharp
+public struct ManifestPluginDTO : IStructSerializable, IPrintable
+{
+    public string? Name { get; set; }
+    public string? Id { get; set; }
+    public string? IdLocal { get; set; }
+    public bool? OutSideIntance { get; set; }
+}
+```
+
+**Wire layout:**
+
+| Field | Type | Encoding |
+|---|---|---|
+| `Name` | `string?` | `char[]` with 3-byte length prefix |
+| `Id` | `string?` | `char[]` with 3-byte length prefix |
+| `IdLocal` | `string?` | `char[]` with 3-byte length prefix |
+| `OutSideIntance` | `bool?` | `sbyte` (1 byte, nullable tri-state) |
+
+---
+
+## ReferencePluginStore
+
+An entry in the global plugin storage registry. Tracks what has been downloaded but is independent of any specific instance installation.
+
+```csharp
+public class ReferencePluginStore : IManifest, IToDTO<ReferencePluginStoreDTO>, IToSerializeDTO
+{
+    public string? Name { get; set; }
+    public string? Id { get; set; }       // GUID string
+    public string? FileName { get; set; } // filename of the downloaded archive
+    public string? UrlWeb { get; set; }   // original download URL
+    public string? Version { get; set; }
+}
+```
+
+---
+
+## ReferencePluginStoreDTO
+
+Wire format for `ReferencePluginStore`, used in `ServicePluginStorage` responses.
+
+```csharp
+public struct ReferencePluginStoreDTO : IStructSerializable, IPrintable
+{
+    public string? Name { get; set; }
+    public string? Id { get; set; }
+    public string? FileName { get; set; }
+    public string? UrlWeb { get; set; }
+    public string? Version { get; set; }
+}
+```
+
+**Wire layout:**
+
+| Field | Type | Encoding |
+|---|---|---|
+| `Name` | `string?` | `char[]` with 3-byte length prefix |
+| `Id` | `string?` | `char[]` with 3-byte length prefix |
+| `FileName` | `string?` | `char[]` with 3-byte length prefix |
+| `UrlWeb` | `string?` | `char[]` with 3-byte length prefix |
+| `Version` | `string?` | `char[]` with 3-byte length prefix |
+
+---
+
+## DirectoryHandwritten
+
+Tracks the files and directories created when a plugin is installed. Used by `ManagerPlugin` to cleanly uninstall a plugin by reversing its installation footprint.
+
+```csharp
+public class DirectoryHandwritten
+{
+    public List<string> Directories { get; set; } = new();
+    public List<string> Files { get; set; } = new();
+
+    [JsonIgnore]
+    public string? Root { get; set; }         // root path (not serialized to JSON)
+
+    public long GetSize()                      // count of Directories + Files
+    public string ToJson()                     // indented JSON
+    public string ToJson(JsonSerializerOptions options)
+}
+```
+
+`GetSize()` returns `Directories.Count + Files.Count` as a `long` — used during uninstall to set the max progress value for the client's progress bar.
+
+---
+
+## MaxProgressDTO
+
+Sent from the server to the client at the start of a long operation to configure the progress bar's maximum value.
+
+```csharp
+public struct MaxProgressDTO : IStructSerializable
+{
+    // wraps a long value representing the total operation size
+}
+```
+
+The client receives it via the `CodeServicesClient.SetMaxProgress` action. The server then sends incremental updates via `CodeServicesClient.SetBarProgress`.
+
+---
+
+## Deserialization Example
+
+```csharp
+// Client receives GetAllInstances response payload
+ReadOnlySpan<byte> reader = responsePayload;
+
+int count = (int)reader.Read<ThreeQuartersInt>();
+var instances = new ReferenceInstanceDTO[count];
+
+for (int i = 0; i < count; i++)
+    instances[i] = reader.ReadStruct<ReferenceInstanceDTO>();
+```

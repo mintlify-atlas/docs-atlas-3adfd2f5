@@ -1,0 +1,281 @@
+---
+title: "Binary Serialization: Serialineitor, BufferWriter, and BufferReader"
+sidebarTitle: "Serialization"
+description: "How Terbin serializes and deserializes unmanaged types, arrays, and IStructSerializable structs using Span-based zero-allocation APIs."
+---
+
+Terbin transmits all data as raw binary over named pipes. The serialization layer is designed around three goals: **zero heap allocation on the hot path**, **`Span<byte>`-based reads and writes**, and **explicit control over layout** via the `IStructSerializable` interface. Every packet, header, and payload is encoded and decoded through the APIs described on this page.
+
+## `IStructSerializable` — The Serialization Contract
+
+Any type that participates in Terbin's packet system implements this interface:
+
+```csharp
+public interface IStructSerializable
+{
+    int GetSize();
+    void WriteTo(Span<byte> pBuffer);
+    void ReadFrom(ReadOnlySpan<byte> pBuffer);
+
+    // Default implementations provided by the interface:
+    byte[] Serialize();
+    void Deserialize(byte[] pArray);
+}
+```
+
+<ResponseField name="GetSize()" type="int">
+  Returns the exact number of bytes this instance will occupy when serialized. Used to pre-allocate buffers without over-allocation.
+</ResponseField>
+
+<ResponseField name="WriteTo(Span<byte>)" type="void">
+  Writes the instance's fields sequentially into the provided `Span<byte>` starting at offset 0. No length prefix is included — the caller is responsible for knowing the size.
+</ResponseField>
+
+<ResponseField name="ReadFrom(ReadOnlySpan<byte>)" type="void">
+  Populates the instance's fields by reading from the provided `ReadOnlySpan<byte>` starting at offset 0.
+</ResponseField>
+
+`PacketRequest`, `IdArray`, and other packet-level structs all implement `IStructSerializable`.
+
+## `ThreeQuartersInt` — 3-Byte Array Length Encoding
+
+Serialized arrays in Terbin use a 3-byte length prefix instead of the standard 4-byte `int`. This custom type saves 1 byte per array and supports lengths up to 16,777,215 elements:
+
+```csharp
+[StructLayout(LayoutKind.Sequential, Pack = 1)]
+public struct ThreeQuartersInt : IConvertible, IMinMaxValue<ThreeQuartersInt>
+{
+    public const int MaxValue = 0xFF_FF_FF; // 16,777,215
+    public const int MinValue = 0x0;
+    public const int Size = 3;              // bytes occupied on the wire
+}
+```
+
+`ThreeQuartersInt` implicitly converts to and from `int` and `uint`, and it integrates with `MemoryMarshal.Write` / `MemoryMarshal.Read` through its sequential 3-byte layout.
+
+<Note>
+  The first `ThreeQuartersInt.Size` (3) bytes of any serialized array are the element count header — but they encode the **byte count** of the elements, not the element count. For example, a `float[]` with 4 elements writes `4 * sizeof(float) = 16` into the prefix, not `4`. `Serialineitor.GetArraySize<T>(int length)` handles this calculation automatically.
+</Note>
+
+## `Serialineitor` — Static and Instance Serialization
+
+`Serialineitor` provides both a fluent **instance API** (append-and-grow) and a **static API** (direct, no instance state) for all common serialization tasks.
+
+### Static Methods
+
+#### Unmanaged Scalars
+
+```csharp
+public static byte[] Serialize<T>(T pValue) where T : unmanaged
+public static T Deserialize<T>(byte[] pBuffer) where T : unmanaged
+public static T Deserialize<T>(byte[] pBuffer, int pOffset) where T : unmanaged
+```
+
+Converts a single unmanaged value (e.g., `int`, `ushort`, `float`, a blittable struct) to/from a `byte[]` using `MemoryMarshal.Write` / `MemoryMarshal.Read` — no boxing, no intermediate copies.
+
+```csharp
+// Serialize a ushort request ID
+byte[] idBytes = Serialineitor.Serialize<ushort>(pHead.IdRequest);
+
+// Deserialize a ushort from a payload
+ushort id = Serialineitor.Deserialize<ushort>(pParameters);
+```
+
+#### IStructSerializable Structs
+
+```csharp
+public static byte[] SerializeStructRaw<T>(T pStruct)
+    where T : struct, IStructSerializable
+
+public static T DeserializeStructRaw<T>(byte[] pBuffer)
+    where T : struct, IStructSerializable
+```
+
+Allocates a `byte[]` of `pStruct.GetSize()` bytes, calls `WriteTo` (or creates a new `T()` and calls `ReadFrom`). Used internally by `StreamWriteStruct` and `StreamReadStruct` to encode/decode every `PacketRequest` written to the pipe.
+
+#### Array Helpers
+
+```csharp
+// Compute the buffer size needed for an array (byte count of elements)
+public static ThreeQuartersInt GetArraySize<T>(int pLength) where T : unmanaged
+public static ThreeQuartersInt GetArraySize<T>(ThreeQuartersInt pLength) where T : unmanaged
+
+// Raw byte[] of elements with no length prefix — for use with IdArray internals
+public static byte[] SerializeArrayRaw<T>(T[] pArray) where T : unmanaged
+public static T[] DeserializeArrayRaw<T>(ReadOnlySpan<byte> pArray, int? pLenght = null)
+    where T : unmanaged
+```
+
+#### `CastToByte`
+
+```csharp
+public static byte[] CastToByte(params object[] pData)
+```
+
+Converts an `object[]` — typically enum values from `[TerbinExecutable(params object[])]` — to a `byte[]` using `Convert.ToByte`. Throws `ArgumentException` if any element cannot be safely cast to `byte`.
+
+#### `Splice`
+
+```csharp
+public static byte[] Splice(byte[] pFirst, byte[] pSecond)
+public static byte[] Splice(params byte[][] pArrays)
+```
+
+Concatenates two or more byte arrays into a single contiguous allocation. Useful for combining independently serialized fields before sending.
+
+### Instance (Fluent) API
+
+The instance `Serialineitor` maintains an internal auto-growing `byte[]` buffer and an `_offset` cursor:
+
+```csharp
+var s = new Serialineitor();
+s.Add<ushort>(42)
+ .AddArray<float>(new float[] { 1.0f, 2.0f })
+ .AddStruct(myIdArray);
+
+byte[] result = s.Serialize(); // or s.ToArray()
+```
+
+| Method | What it adds |
+|---|---|
+| `Add<T>(T value)` | A single unmanaged value |
+| `AddArray<T>(T[] array)` | A `ThreeQuartersInt` length prefix followed by the element bytes |
+| `AddStruct<T>(T struct)` | An `IStructSerializable` struct via `SerializeStructRaw` |
+| `Serialize()` / `ToArray()` | Returns the filled portion of the buffer as a new `byte[]` |
+| `Clear()` | Resets the offset (zeroes the buffer) for reuse |
+
+## `BufferWriter` — Span-Based Sequential Writes
+
+`BufferWriter` (static class) writes into a pre-allocated `Span<byte>` and advances an `int` offset by reference:
+
+```csharp
+// Write a single unmanaged value
+public static void Add<T>(Span<byte> pBuffer, ref int pOffset, T pValue)
+    where T : unmanaged
+
+// Write an array with ThreeQuartersInt length prefix
+public static void AddArray<T>(Span<byte> pBuffer, ref int pOffset, T[] pArray)
+    where T : unmanaged
+
+// Write an IStructSerializable struct
+public static void AddStruct<T>(Span<byte> pBuffer, ref int pOffset, T pStruct)
+    where T : struct, IStructSerializable
+```
+
+These are the methods called by the instance `Serialineitor` internally. They validate buffer capacity and throw `ArgumentOutOfRangeException` if the span is too small.
+
+### `BufferWriterExtension` — Slicing Variants
+
+`BufferWriterExtension` provides **two** extension method families on `Span<byte>`:
+
+**Slicing variants** (`ref Span<byte>`) — advance the span itself so no offset variable is needed:
+
+```csharp
+public static BufferErrorCode Write<T>(this ref Span<byte> pBuffer, T pValue)
+    where T : unmanaged
+
+public static BufferErrorCode WriteArray<T>(this ref Span<byte> pBuffer, T[] pArray)
+    where T : unmanaged
+
+public static BufferErrorCode WriteStruct<T>(this ref Span<byte> pBuffer, T pStruct)
+    where T : struct, IStructSerializable
+```
+
+Each returns a `BufferErrorCode` (`Succes`, `BufferSmall`, or `SurpassesMax`) instead of throwing.
+
+**Offset variants** (non-ref `Span<byte>`, `ref int pOffset`) — keep the original span intact and advance only the index:
+
+```csharp
+public static void Write<T>(this Span<byte> pBuffer, ref int pOffset, T pValue)
+    where T : unmanaged
+
+public static void WriteArray<T>(this Span<byte> pBuffer, ref int pOffset, T[] pArray)
+    where T : unmanaged
+
+public static void WriteStruct<T>(this Span<byte> pBuffer, ref int pOffset, T pStruct)
+    where T : struct, IStructSerializable
+```
+
+<Tip>
+  Prefer the slicing `Write<T>(ref Span<byte>)` variants in hot paths such as `IStructSerializable.WriteTo` implementations. They eliminate the offset variable entirely and produce slightly tighter code, since the span's `Length` automatically shrinks and guards against over-writing.
+</Tip>
+
+## `BufferReader` and `BufferReaderExtension` — Span-Based Sequential Reads
+
+`BufferReader` (static class) reads from `ReadOnlySpan<byte>` with an `int` offset:
+
+```csharp
+// Read a single unmanaged value and advance offset
+public static T Get<T>(ReadOnlySpan<byte> pBuffer, ref int pOffset) where T : unmanaged
+
+// Read an array (reads ThreeQuartersInt prefix first, then element bytes)
+public static T[] GetArray<T>(ReadOnlySpan<byte> pBuffer, ref int pOffset) where T : unmanaged
+
+// Read an IStructSerializable struct
+public static T GetStruct<T>(ReadOnlySpan<byte> pBuffer, ref int pOffset, T pStruct)
+    where T : struct, IStructSerializable
+```
+
+`BufferReaderExtension` adds extension methods to `ReadOnlySpan<byte>`:
+
+```csharp
+// Slicing variants (advance the span itself):
+public static T Read<T>(this ref ReadOnlySpan<byte> pBuffer) where T : unmanaged
+public static T[] ReadArray<T>(this ref ReadOnlySpan<byte> pBuffer) where T : unmanaged
+public static T ReadStruct<T>(this ref ReadOnlySpan<byte> pBuffer)
+    where T : struct, IStructSerializable
+
+// Offset variants (keep span intact, advance index):
+public static T Read<T>(this ReadOnlySpan<byte> pBuffer, ref int pOffset) where T : unmanaged
+public static T[] ReadArray<T>(this ReadOnlySpan<byte> pBuffer, ref int pOffset) where T : unmanaged
+public static T ReadStruct<T>(this ReadOnlySpan<byte> pBuffer, ref int pOffset)
+    where T : struct, IStructSerializable
+```
+
+These extensions are used inside `PacketRequest.ReadFrom` and `IdArray.ReadFrom` to deserialize the wire bytes back into structs.
+
+## `BufferErrorCode` Enum
+
+Returned by the slicing `BufferWriterExtension` methods to signal write failures without exceptions:
+
+| Value | Meaning |
+|---|---|
+| `Succes` (1) | Write completed successfully |
+| `BufferSmall` (3) | The destination span was too small for the data |
+| `SurpassesMax` (2) | The array length exceeded `ThreeQuartersInt.MaxValue` |
+
+## `AutoStructSerializable` — Source Generator (Disabled)
+
+`AutoStructSerializable` is a Roslyn `IIncrementalGenerator` that would automatically generate `GetSize()`, `WriteTo()`, and `ReadFrom()` implementations for any struct implementing `IAutoSerializable`. It is currently **disabled** (`#if false`). All `IStructSerializable` implementations in the framework are handwritten.
+
+## Practical Example: Serializing a Response Payload
+
+The following pattern is used throughout application services to build a response payload from multiple fields:
+
+```csharp
+[TerbinExecutable((byte)CodeServices.ReadAll, (byte)CodeServicesSection.Instances)]
+public static async Task<InfoResponse?> GetAllInstances(
+    Header pHead, byte[] pParameters, CancellationToken pToken)
+{
+    if (pToken.IsCancellationRequested) return null;
+
+    // Build the response using the fluent Serialineitor
+    var s = new Serialineitor();
+    s.Add<uint>((uint)instanceCount)        // a single uint field
+     .AddArray<byte>(instanceNameBytes)     // array with 3-byte length prefix
+     .AddStruct(someIdArray);              // an IStructSerializable struct
+
+    byte[] payload = s.Serialize();
+    return InfoResponse.CreateSucces(pHead.IdRequest, payload);
+}
+
+// Receiver-side: deserialize the payload
+static void ParseInstanceResponse(byte[] payload)
+{
+    ReadOnlySpan<byte> buffer = payload;
+
+    uint count    = buffer.Read<uint>();         // advances buffer by 4
+    byte[] names  = buffer.ReadArray<byte>();    // reads 3-byte prefix + data
+    // remaining bytes hold the IdArray struct...
+}
+```

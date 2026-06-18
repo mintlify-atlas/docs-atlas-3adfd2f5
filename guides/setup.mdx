@@ -1,0 +1,199 @@
+---
+title: "Set Up and Deploy TerbinService"
+sidebarTitle: "Setup"
+description: "How to build, configure, and run TerbinService as a .NET background service: prerequisites, config.json keys, and first-run checklist."
+---
+
+This guide walks you through everything you need to get TerbinService built, configured, and running on your machine. By the end you will have a live named-pipe background service ready to accept connections from mod manager clients or from the bundled [SimulateClient](/guides/simulate-client) test harness.
+
+## Prerequisites
+
+Before you begin, make sure the following are installed and available on your `PATH`:
+
+- **.NET 8 SDK or later** — TerbinService targets `net8.0`. Download from [dot.net](https://dotnet.microsoft.com/download).
+- **Windows** — Named pipes (`System.IO.Pipes.NamedPipeServerStream`) are the transport layer. Linux support via Proton is available for the game-launch helpers but the service itself is designed for Windows hosts.
+- **Visual Studio 2022** (Community or higher) _or_ the `dotnet` CLI — either works for building and running the solution.
+
+---
+
+## Building
+
+<Steps>
+  <Step title="Clone the repository">
+    ```bash
+    git clone https://github.com/FarlandsModdingTeam/TerbinProyect.git
+    cd TerbinProyect
+    ```
+  </Step>
+
+  <Step title="Open the solution">
+    Open `TerbinProyect.sln` (or `TerbinProyect.slnx` if you are on a newer SDK preview) in Visual Studio 2022, or stay in the terminal for the next step.
+  </Step>
+
+  <Step title="Build">
+    **Visual Studio:** select *Build → Build Solution* (`Ctrl+Shift+B`).
+
+    **CLI:**
+    ```bash
+    dotnet build TerbinService/TerbinService.csproj
+    ```
+  </Step>
+
+  <Step title="Publish (optional)">
+    Produce a self-contained deployment artefact:
+    ```bash
+    dotnet publish TerbinService/TerbinService.csproj \
+      -c Release \
+      -r win-x64 \
+      --self-contained true \
+      -o ./publish/TerbinService
+    ```
+    The output directory will contain the executable and all required DLLs.
+  </Step>
+</Steps>
+
+---
+
+## Configuration
+
+TerbinService reads its settings from a single JSON file at startup.
+
+### Location
+
+```
+TerbinService/config/config.json
+```
+
+### Default content
+
+```json
+{
+  "rute_farlands": "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Farlands",
+  "rute_instances": "C:\\Users\\PC\\Documents\\TerbinInstances",
+  "rute_plugins": "C:\\Users\\PC\\Documents\\TerbinStorage"
+}
+```
+
+If the file does not exist when the service first starts, `Manager.Configuration` writes default values automatically — it calls `ManagerFarlands.GetRuteSteamFarlands()` to auto-detect the Farlands install path via the Steam library registry/VDF, and derives the instance and plugin paths from `Environment.SpecialFolder.MyDocuments`.
+
+### Configuration keys
+
+The constants that correspond to each JSON key are defined in `TerbinLibrary.Configuration.TerbinConfiguration`.
+
+| JSON key | `TerbinConfiguration` constant | Type | Required | Description |
+|---|---|---|---|---|
+| `rute_farlands` | `RUTE_FARLANDS` | `string` (path) | Recommended | Absolute path to the Farlands game installation directory (the folder that contains `Farlands.exe`). Auto-detected from Steam on first run if omitted. |
+| `rute_instances` | `RUTE_INSTANCES` | `string` (path) | Yes | Directory where Terbin creates and manages game instances. Defaults to `<Documents>/TerbinInstances`. |
+| `rute_plugins` | `RUTE_STORAGE_PLUGINS` | `string` (path) | Yes | Plugin storage directory (the central mod cache). Defaults to `<Documents>/TerbinStorage`. |
+| `rute_steam` | `RUTE_STEAM` | `string` (path) | Optional | Override for the Steam root installation path. Used by `ManagerProton` and other Steam helpers when the auto-detection is insufficient. |
+| `rute_proton` | `RUTE_PROTON` | `string` (path) | Optional | Path to the Proton binary used to launch Windows executables under Linux Steam Play. |
+| `rute_proton_tmp` | `RUTE_PROTON_TMP` | `string` (path) | Optional | Temporary working directory for Proton operations. |
+
+<Note>
+  `rute_steam`, `rute_proton`, and `rute_proton_tmp` are optional on Windows. They are only needed when running instances through Steam Play (Proton) on Linux — see the [Steam & Proton](/guides/steam-proton) guide for details.
+</Note>
+
+### Reading and writing config at runtime
+
+`Manager.Configuration` exposes thread-safe helpers for use inside service handlers:
+
+```csharp
+// Read a value (throws if key is missing and no default exists)
+string farlandsPath = Manager.Configuration.GetConfg(TerbinConfiguration.RUTE_FARLANDS);
+
+// Write / update a value and persist it back to config.json
+Manager.Configuration.SetConfig(TerbinConfiguration.RUTE_INSTANCES, @"D:\MyInstances");
+```
+
+An `OnChangeConfig` event fires asynchronously after every successful write, giving other subsystems a hook to react to path changes without polling.
+
+---
+
+## Running the Service
+
+### Development mode (CLI)
+
+```bash
+dotnet run --project TerbinService
+```
+
+### Development mode (Visual Studio)
+
+Set `TerbinService` as the startup project and press **F5** (or **Ctrl+F5** for without debugger).
+
+### As a Windows service
+
+After publishing, register the executable with the Windows Service Control Manager:
+
+```powershell
+sc.exe create TerbinService binPath= "C:\path\to\publish\TerbinService\TerbinService.exe"
+sc.exe start TerbinService
+```
+
+<Note>
+  On startup, `Worker` uses reflection to scan both `TerbinLibrary` and `TerbinService` for methods decorated with the internal `[TODO]` attribute and prints them to the console. This diagnostic output lets developers see at a glance which features are still pending implementation. It is not an error — it is intentional.
+
+  ```
+  Por Hacer TerbinLibrary:
+    [TODO] NodeUtil.CloneDirectory — (Verano)Permitira actualizar farlands ...
+    ...
+  Por Hacer TerbinService:
+    [TODO] ManagerConfiguration — Que el json no sea un Dictionary<string, string>...
+    ...
+  ```
+</Note>
+
+---
+
+## Named-Pipe Transport
+
+TerbinService uses Windows named pipes as its IPC mechanism. The pipe name is defined in `Worker` and the `TerbinCommunicator` class:
+
+```csharp
+// Worker.cs — inside autoCreatePipe()
+var communicator = new TerbinCommunicator(true, pTokenCancellation);
+```
+
+The boolean `true` argument tells `TerbinCommunicator` to create the **server** side of the pipe. Clients pass `false`.
+
+### Multi-client model
+
+When a client connects, the `OnNewClientConnect` callback immediately spawns a fresh pipe instance on a new `Task`, so that the next client can connect while the current one is being served:
+
+```csharp
+communicator.OnNewClientConnect += async () =>
+{
+    _ = Task.Run(() => autoCreatePipe(pTokenCancellation), pTokenCancellation);
+};
+```
+
+This means the service can handle multiple simultaneous clients, each on its own pipe instance and async context — no single shared connection is ever blocked.
+
+### Stopping the service
+
+Send a `CodeTerbinProtocol.Stop` packet (e.g. via `SimulateClient`) to trigger a graceful shutdown:
+
+```csharp
+[TerbinExecutable((byte)CodeTerbinProtocol.Stop)]
+public static async Task<InfoResponse?> Stop(Header pHead, byte[] pParameters, CancellationToken pToken)
+```
+
+The `Stop` handler responds with a success packet, then schedules `IHostApplicationLifetime.StopApplication()` after a 100 ms delay so the response is flushed before the process exits.
+
+---
+
+## Verifying the Service is Running
+
+The fastest way to confirm the service is accepting connections is to run [SimulateClient](/guides/simulate-client):
+
+```bash
+dotnet run --project SimulateClient
+```
+
+If the pipe is up you will see:
+
+```
+[Client] ¡Conectado!
+```
+
+If the pipe is not available, SimulateClient prints `[Client] ¡Error de Conexion!` and exits.

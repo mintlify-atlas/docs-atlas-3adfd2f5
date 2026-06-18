@@ -1,0 +1,262 @@
+---
+title: "ExecutableDispatcher: Thread-Safe Packet Routing Engine"
+sidebarTitle: "ExecutableDispatcher"
+description: "Reference for ExecutableDispatcher and the TerbinExecutableManager static façade — registering, unregistering, and dispatching IPC actions."
+---
+
+`ExecutableDispatcher` is the heart of Terbin's IPC routing layer. It maintains two `ConcurrentDictionary` maps — one from `ByteArrayKey` to a list of `TerbinExecutableDelegate` handlers, and one from `ByteArrayKey` to a per-action `CancellationTokenSource` — ensuring that both registration and dispatch are fully thread-safe. `TerbinExecutableManager` wraps a private singleton instance of `ExecutableDispatcher` and exposes the same API as a set of `static` methods so service code never has to manage the dispatcher's lifetime directly.
+
+---
+
+## `ByteArrayKey`
+
+Before examining the dispatcher, it helps to understand the key type it uses.
+
+```csharp
+public readonly struct ByteArrayKey
+    : IEnumerable<byte>, IEquatable<ByteArrayKey>, IEquatable<IEnumerable<byte>>
+```
+
+`ByteArrayKey` wraps a cloned `byte[]` and overrides `GetHashCode` / `Equals` so that two arrays with the same byte sequence are considered equal. This makes it suitable as a `ConcurrentDictionary` key where a plain `byte[]` reference comparison would fail.
+
+```csharp
+// Implicit conversions are defined, so you rarely construct it directly:
+ByteArrayKey key = new byte[] { 20, 30 };   // implicit from byte[]
+byte[] raw       = key;                      // implicit to byte[]
+```
+
+The hash algorithm multiplies each byte against a prime base:
+
+```csharp
+int hash = 17;
+for (int i = 0; i < _data.Length; i++)
+    hash = hash * 31 + _data[i];
+```
+
+---
+
+## `ExecutableDispatcher`
+
+```csharp
+public sealed class ExecutableDispatcher : IExecutableDispatcher
+```
+
+### Internal State
+
+| Field | Type | Purpose |
+|---|---|---|
+| `_handlers` | `ConcurrentDictionary<IEquatable<IEnumerable<byte>>, List<TerbinExecutableDelegate>>` | Maps each action key to its ordered list of handlers. Multiple handlers per key are supported. |
+| `_activeExecutionsByAction` | `ConcurrentDictionary<IEquatable<IEnumerable<byte>>, CancellationTokenSource>` | One `CancellationTokenSource` per registered action key. Cancellation is scoped to the action, not the entire dispatcher. |
+
+### Per-Action `CancellationTokenSource`
+
+When a new action key is registered for the first time, `ExecutableDispatcher` creates a fresh `CancellationTokenSource` for it and stores it in `_activeExecutionsByAction`. Every call to `DispatchAsync` retrieves this CTS and passes its `.Token` into `TerbinExecutableHelper.ExecutionList`. This means:
+
+- Cancelling action `[20, 30]` does **not** affect the execution of any other action key.
+- The same CTS is reused for all subsequent dispatches on that key until it is cancelled (via `CodeStatus.CancelByAction`) and removed.
+
+---
+
+### Methods
+
+#### `Register`
+
+```csharp
+public void Register(IExecutableAttribute pAction, TerbinExecutableDelegate pHandler)
+```
+
+Registers `pHandler` under the byte key defined by `pAction.Action`. If the key already exists, the handler is appended to the existing list. If it is a new key, a new list and a new `CancellationTokenSource` are created atomically.
+
+<ParamField path="pAction" type="IExecutableAttribute" required>
+  The attribute instance that carries the `byte[]` action key. Throws `ArgumentException` if `pAction.Action` is empty.
+</ParamField>
+
+<ParamField path="pHandler" type="TerbinExecutableDelegate" required>
+  The handler delegate. Throws `ArgumentNullException` if null.
+</ParamField>
+
+```csharp
+// Manual registration (rarely needed — prefer TerbinExecutor.Register)
+var attr = new TerbinExecutableAttribute((byte)CodeServices.Info);
+TerbinExecutableManager.Register(attr, MyHandler);
+```
+
+---
+
+#### `Unregister`
+
+```csharp
+public bool Unregister(IEquatable<IEnumerable<byte>> pActions)
+```
+
+Removes **all** handlers registered under `pActions`. Returns `true` if the key existed and was removed; `false` otherwise. Note: the associated `CancellationTokenSource` is **not** removed by `Unregister` — only by a `CancelByAction` dispatch.
+
+<ParamField path="pActions" type="IEquatable&lt;IEnumerable&lt;byte&gt;&gt;" required>
+  The action key to remove. Pass a `ByteArrayKey` or any `IEquatable<IEnumerable<byte>>` that equals the registered key.
+</ParamField>
+
+---
+
+#### `DispatchAsync`
+
+```csharp
+public async Task<InfoResponse?> DispatchAsync(
+    Header pHead,
+    byte[] pPayload,
+    IEquatable<IEnumerable<byte>> pActions)
+```
+
+The main packet-routing entry point. Resolves the handler list for `pActions`, interprets `pHead.Status`, and invokes the appropriate logic.
+
+<ParamField path="pHead" type="Header" required>
+  Packet header. The `Status` field drives which code path executes (see branch table below).
+</ParamField>
+
+<ParamField path="pPayload" type="byte[]" required>
+  Raw payload bytes forwarded to the handler(s).
+</ParamField>
+
+<ParamField path="pActions" type="IEquatable&lt;IEnumerable&lt;byte&gt;&gt;" required>
+  The action key to look up. Typically `pCapsule.ActionMethod` as supplied by the communicator.
+</ParamField>
+
+**`CodeStatus` branch table:**
+
+<Accordion title="CodeStatus.Execute (default)">
+  The normal execution path. Retrieves the per-action CTS and calls `TerbinExecutableHelper.ExecutionList`, which runs all handlers concurrently and returns the first non-null `InfoResponse`.
+
+  This branch is the implicit default — the dispatcher deliberately avoids an explicit check for `Execute` so it is never compared in the hot path.
+</Accordion>
+
+<Accordion title="CodeStatus.CheckExecution">
+  Does **not** invoke any handler. Returns `InfoResponse.CreateSucces(pHead.IdRequest)` immediately if at least one handler is registered for the key. Useful for clients that want to probe whether a service endpoint exists before sending real data.
+</Accordion>
+
+<Accordion title="CodeStatus.CancelByAction">
+  Attempts to remove and cancel the `CancellationTokenSource` for the given action key. Returns `InfoResponse.CreateSucces` on success, or `InfoResponse.Create(..., CodeStatus.ActionNotInitiated)` if no CTS was found.
+</Accordion>
+
+<Accordion title="CodeStatus.CancelByRequest">
+  Not yet implemented. Currently returns `null`.
+</Accordion>
+
+**Error returns:**
+
+| Condition | Returned `CodeStatus` |
+|---|---|
+| No handler registered for `pActions` | `CodeStatus.ActionNotFound` |
+| Handler throws an unhandled exception | `CodeStatus.ExecutionException` (payload contains serialized `ExceptionDTO`) |
+| `pActions` equals the `Response` key but no handler is found | Throws `NotImplementedException` |
+
+---
+
+#### `TryGetEntity` (static)
+
+```csharp
+public static bool TryGetEntity(
+    byte[] pPayload,
+    out byte pEntity,
+    out byte[] pMemory)
+```
+
+A utility method for handlers that follow the entity-prefixed payload convention. Extracts the first byte as an entity ID and the remainder as the body.
+
+<ParamField path="pPayload" type="byte[]" required>
+  The full payload received by the handler.
+</ParamField>
+
+<ResponseField name="pEntity" type="byte">
+  The first byte of the payload, interpreted as an entity identifier.
+</ResponseField>
+
+<ResponseField name="pMemory" type="byte[]">
+  The payload bytes after the entity byte. Empty array if payload was only one byte long.
+</ResponseField>
+
+<ResponseField name="return" type="bool">
+  `false` if `pPayload` is null or empty; `true` otherwise.
+</ResponseField>
+
+```csharp
+// Inside a CRUD handler that sub-dispatches by entity type:
+if (!ExecutableDispatcher.TryGetEntity(pParameters, out var entity, out var memo))
+    return InfoResponse.Create(pHead.IdRequest, CodeStatus.ErrorNotPayload);
+
+// entity → first byte (e.g. which object type to target)
+// memo   → remaining payload to deserialize
+```
+
+---
+
+#### `RegisterFromAssembly`
+
+```csharp
+public void RegisterFromAssembly(Assembly pAssembly)
+```
+
+Delegates to `TerbinExecutableHelper.RegisterFromAssembly<TerbinExecutableAttribute, ExecutableDispatcher>(pAssembly, this)`. Scans all types and static methods in `pAssembly`, validates their signatures, and calls `Register` for each valid decorated method.
+
+---
+
+## `TerbinExecutableManager` (static façade)
+
+```csharp
+public static class TerbinExecutableManager
+```
+
+`TerbinExecutableManager` owns a private `ExecutableDispatcher _dispatcher = new()` and exposes the full `IExecutableDispatcher` surface as static methods. All service code should use `TerbinExecutableManager` rather than instantiating `ExecutableDispatcher` directly.
+
+<CodeGroup>
+```csharp Register
+TerbinExecutableManager.Register(attribute, handler);
+```
+
+```csharp Unregister
+bool removed = TerbinExecutableManager.Unregister(actionKey);
+```
+
+```csharp DispatchAsync
+InfoResponse? response = await TerbinExecutableManager.DispatchAsync(
+    pCapsule.Head,
+    pCapsule.Payload,
+    pCapsule.ActionMethod);
+```
+
+```csharp RegisterFromAssembly
+TerbinExecutableManager.RegisterFromAssembly(Assembly.GetExecutingAssembly());
+```
+</CodeGroup>
+
+### Dispatch inside the Worker
+
+The communicator's `OnRecive` event passes every received packet directly to `TerbinExecutableManager.DispatchAsync`:
+
+```csharp
+communicator.OnRecive += async (pCapsule) =>
+{
+    Console.Log($"Packet: {pCapsule}");
+    CurrentContext.Value = new InfoLocalThreads
+    {
+        Communicator = communicator,
+    };
+    return await TerbinExecutableManager.DispatchAsync(
+        pCapsule.Head,
+        pCapsule.Payload,
+        pCapsule.ActionMethod);
+};
+```
+
+---
+
+## `ExecutableDispatcherSimple` (obsolete)
+
+<Note>
+  `ExecutableDispatcherSimple` and its static façade `TerbinExecutableManagerSimple` are marked `[Obsolete]`. Both use a `ConcurrentDictionary<byte, …>` keyed only on a single byte and most of their methods throw `NotImplementedException`. Do not use them in new code.
+</Note>
+
+---
+
+## See Also
+
+- [`[TerbinExecutable]` Attribute](/api/terbin-executable-attribute) — how to annotate methods and configure action keys.
+- [TerbinExecutor](/api/terbin-executor) — the assembly scanner that feeds `TerbinExecutableManager` at startup.
